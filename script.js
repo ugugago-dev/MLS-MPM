@@ -617,8 +617,10 @@ overlay.addEventListener("contextmenu", (e) => e.preventDefault());
 
 overlay.addEventListener("pointerdown", (e) => {
     const cv = cameraVectors(camera);
+    const _pdAspect = c.width / c.height;
+    const _pdFovY = 2 * Math.atan(Math.tan(camera.fovy / 2) / Math.min(_pdAspect, 1));
     const vp = mat4Multiply(
-        mat4Perspective(camera.fovy, c.width / c.height, camera.near, camera.far),
+        mat4Perspective(_pdFovY, _pdAspect, camera.near, camera.far),
         mat4LookAt(cv.eye, camera.target, [0, 1, 0])
     );
 
@@ -712,15 +714,17 @@ function screenToWorld(sx, sy, cam, cv) {
     const ndcX = (sx / logicalW) * 2 - 1;
     const ndcY = 1 - (sy / logicalH) * 2;
     const aspect = logicalW / logicalH;
-    const th = Math.tan(cam.fovy / 2);
+    // Match the same "shorter-side FOV" rule used in the renderer
+    const thV = Math.tan(cam.fovy / 2) / Math.min(aspect, 1);
+    const thH = thV * aspect;
     // camera front direction (eye → target, normalized)
     const fx = cam.target[0] - cv.eye[0], fy = cam.target[1] - cv.eye[1], fz = cam.target[2] - cv.eye[2];
     const fl = Math.hypot(fx, fy, fz) || 1;
     const fd = [fx / fl, fy / fl, fz / fl];
     // ray direction through NDC pixel
-    let rdx = fd[0] + ndcX * th * aspect * cv.right[0] + ndcY * th * cv.up[0];
-    let rdy = fd[1] + ndcX * th * aspect * cv.right[1] + ndcY * th * cv.up[1];
-    let rdz = fd[2] + ndcX * th * aspect * cv.right[2] + ndcY * th * cv.up[2];
+    let rdx = fd[0] + ndcX * thH * cv.right[0] + ndcY * thV * cv.up[0];
+    let rdy = fd[1] + ndcX * thH * cv.right[1] + ndcY * thV * cv.up[1];
+    let rdz = fd[2] + ndcX * thH * cv.right[2] + ndcY * thV * cv.up[2];
     const rl = Math.hypot(rdx, rdy, rdz) || 1;
     rdx /= rl; rdy /= rl; rdz /= rl;
     // intersect ray with plane: dot(P - target, fd) = 0
@@ -922,8 +926,11 @@ function startLoop(encodeRender, fluidGPU) {
 
         // compute camera once — reused by both render and hand indicator
         const cv = cameraVectors(camera);
+        // Use the shorter screen dimension as the FOV reference so the
+        // simulation never clips horizontally on portrait screens.
+        const fovY = 2 * Math.atan(Math.tan(camera.fovy / 2) / Math.min(aspect, 1));
         const viewProj = mat4Multiply(
-            mat4Perspective(camera.fovy, aspect, camera.near, camera.far),
+            mat4Perspective(fovY, aspect, camera.near, camera.far),
             mat4LookAt(cv.eye, camera.target, [0, 1, 0])
         );
 

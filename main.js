@@ -13,7 +13,7 @@ import {
 // Fixed 1.8:2:1.8 domain — independent of screen orientation so portrait phones get the same grid size as landscape
 // Capacity is sized above the initial fillBlock() count (~100034 desktop / ~30213 mobile)
 // so there is headroom left for real-time spawnParticles() additions.
-const fluid = new FluidGPU(2, 2, 3, isMobile ? 0.02 : 0.0125, isMobile ? 80000 : 200000);
+const fluid = new FluidGPU(2, 2, 3, isMobile ? 0.0175 : 0.0125, isMobile ? 80000 : 200000);
 fluid.fillBlock(0.05, 0.05, 0.05, 0.95, 0.95, 0.45);
 const diffuse = new DiffuseGPU(DIFFUSE_MAX_COUNT);
 
@@ -394,12 +394,68 @@ function startLoop(encodeRender, tsRes) {
 // ─────────────────────────────────────────────────────────────
 //  Entry point
 // ─────────────────────────────────────────────────────────────
-function showError(err) {
-    console.error(err);
-    octx.clearRect(0, 0, logicalW, logicalH);
-    octx.fillStyle = "#b00";
-    octx.fillText("WebGPU error: " + err.message, 16, 28);
+// On-screen error overlay. Phones give us no console, so surface everything
+// (thrown exceptions, rejected promises, WebGPU uncaptured errors) here as
+// word-wrapped, full-screen readable text. `sticky` errors latch so a later
+// cascade of secondary failures can't scroll the root cause off screen; a
+// non-sticky message (e.g. "device lost, retrying") can still be overwritten.
+let _errorSticky = false;
+function _formatError(err) {
+    if (err == null) return "Unknown error (null)";
+    if (typeof err === "string") return err;
+    if (err instanceof Error) {
+        return (err.name ? err.name + ": " : "") + err.message +
+               (err.stack ? "\n\n" + err.stack : "");
+    }
+    if (err.message) return String(err.message);
+    try { return JSON.stringify(err); } catch { return String(err); }
 }
+function showError(err, sticky = true) {
+    console.error(err);
+    if (_errorSticky) return;          // root cause already latched
+    if (sticky) _errorSticky = true;
+    if (sticky && _animFrameId !== null) { cancelAnimationFrame(_animFrameId); _animFrameId = null; }
+
+    const msg = "WebGPU / runtime error\n\n" + _formatError(err);
+    const pad = 12, lineH = 18, maxW = Math.max(40, logicalW - pad * 2);
+    octx.setTransform(dpr, 0, 0, dpr, 0, 0);   // restore CSS-pixel space (loop may have changed nothing, but be safe)
+    octx.clearRect(0, 0, logicalW, logicalH);
+    octx.fillStyle = "rgba(25,0,0,0.94)";
+    octx.fillRect(0, 0, logicalW, logicalH);
+    octx.font = "14px monospace";
+    octx.textBaseline = "top";
+    octx.fillStyle = "#ff8080";
+
+    // Wrap each source line to the canvas width, hard-breaking overlong tokens.
+    const lines = [];
+    for (const raw of msg.split("\n")) {
+        if (raw === "") { lines.push(""); continue; }
+        let cur = "";
+        for (const tok of raw.split(/(\s+)/)) {
+            const test = cur + tok;
+            if (cur !== "" && octx.measureText(test).width > maxW) { lines.push(cur); cur = tok.replace(/^\s+/, ""); }
+            else cur = test;
+        }
+        while (octx.measureText(cur).width > maxW) {
+            let n = cur.length;
+            while (n > 1 && octx.measureText(cur.slice(0, n)).width > maxW) n--;
+            lines.push(cur.slice(0, n)); cur = cur.slice(n);
+        }
+        lines.push(cur);
+    }
+    let y = pad;
+    for (const ln of lines) {
+        if (y > logicalH - lineH) break;
+        octx.fillText(ln, pad, y);
+        y += lineH;
+    }
+}
+
+// Catch anything that escapes the async init()/loop() call chain (which .catch
+// only covers synchronously-thrown / awaited errors, not stray rejections or
+// errors thrown inside requestAnimationFrame callbacks).
+window.addEventListener("error", (e) => showError(e.error || e.message || "Uncaught error"));
+window.addEventListener("unhandledrejection", (e) => showError(e.reason || "Unhandled promise rejection"));
 
 async function init() {
     if (!navigator.gpu) throw new Error("WebGPU not supported.");
@@ -410,13 +466,27 @@ async function init() {
         requiredFeatures: supportsTs ? ['timestamp-query'] : [],
     });
 
+    // Surface WebGPU validation / out-of-memory errors that aren't thrown but
+    // reported asynchronously (the usual reason a phone just shows a white frame:
+    // a shader/pipeline/allocation failed and nothing on screen ever said so).
+    device.addEventListener?.("uncapturederror", (e) => showError(e.error));
+    if (!device.addEventListener) device.onuncapturederror = (e) => showError(e.error);
+
     device.lost.then(async (info) => {
         if (_animFrameId !== null) { cancelAnimationFrame(_animFrameId); _animFrameId = null; }
         if (info.reason !== "destroyed") {
+            // Non-sticky so a real init error on the retry can still replace it.
+            showError("GPU device lost (" + info.reason + "): " + info.message + " — retrying…", false);
             await new Promise(r => setTimeout(r, 1000));
             init().catch(showError);
         }
     });
+
+    // Bracket all pipeline / buffer / texture creation in error scopes so a
+    // validation or OOM failure during setup is reported precisely (and doesn't
+    // just silently produce a non-functional device).
+    device.pushErrorScope("validation");
+    device.pushErrorScope("out-of-memory");
 
     fluid.initGPU(device);
     diffuse.initGPU(device, fluid);
@@ -429,6 +499,12 @@ async function init() {
     } : null;
 
     const fr = await initFluidRenderer(device, c, fluid.particlePosBuffer, fluid.particleVelBuffer, fluid.particleDensityBuffer, fluid.REST_DENSITY, diffuse);
+
+    const oomErr = await device.popErrorScope();       // innermost first
+    const valErr = await device.popErrorScope();
+    if (valErr) { showError("Validation error during init: " + valErr.message); return; }
+    if (oomErr) { showError("Out-of-memory during init: " + oomErr.message); return; }
+
     startLoop((cmd, count, cv, view, proj, viewProj, renTsq) => fr(cmd, count, cv, view, proj, viewProj, renTsq), tsRes);
 }
 

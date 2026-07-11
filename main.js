@@ -19,6 +19,10 @@ import {
 const particleCountDefault = isMobile ? 80000 : 200000;
 const particleCount = urlNum('p', particleCountDefault);
 const noDiffuse = urlFlag('nodiffuse');
+// ?nosim — skip simFrame() entirely (init + empty command buffer submit only).
+// Used to separate init-time crashes from per-frame-dispatch crashes on mobile
+// Vulkan drivers (VK_ERROR_OUT_OF_HOST_MEMORY triage — see CLAUDE.md).
+const noSim = urlFlag('nosim');
 
 const fluid = new FluidGPU(2, 2, 3, isMobile ? 0.0175 : 0.0125, particleCount);
 fluid.fillBlock(0.05, 0.05, 0.05, 0.95, 0.95, 0.45);
@@ -328,7 +332,7 @@ function startLoop(encodeRender) {
 
         let simSteps = 0;
         while (simAccum >= SIM_STEP_S && simSteps < MAX_SIM_STEPS) {
-            fluid.simFrame(cmd);
+            if (!noSim) fluid.simFrame(cmd);
             simAccum -= SIM_STEP_S;
             simSteps++;
         }

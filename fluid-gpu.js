@@ -1,15 +1,10 @@
-import { WG_SIZE, urlNum } from './config.js';
+import { WG_SIZE } from './config.js';
 import {
     WGSL_CLEAR, WGSL_COMPUTE_WEIGHTS, WGSL_P2G_MASS, WGSL_P2G_MOM,
     WGSL_DECODE_MASS, WGSL_APPLY_HAND, WGSL_UPDATE_GRID, WGSL_G2P,
     WGSL_COMPACT, WGSL_RAYCAST,
 } from './shaders.js';
 import { lineBoxIntersect } from './math.js';
-
-// ?simstage=N — gate simFrame()'s passes at stage N (1=CLEAR .. 8=diffuse.step),
-// skipping everything after. Used to bisect mobile Vulkan driver crashes
-// (VK_ERROR_OUT_OF_HOST_MEMORY triage — see CLAUDE.md). Default 99 = unchanged.
-const SIM_STAGE = urlNum('simstage', 99);
 
 export class FluidGPU {
     constructor(aspectX, aspectY, aspectZ, particleRadius, particleNum) {
@@ -47,8 +42,8 @@ export class FluidGPU {
         this.HARD_MAX_Z = this.grid_Z_num - HM;
 
         // Optional DiffuseGPU instance (spray/foam/bubble tracer particles). When set,
-        // simFrame() dispatches its generate+advect passes once per substep, right
-        // after G2P — see diffuse-gpu.js.
+        // simFrame() dispatches its generate+advect dispatches (into the same shared
+        // compute pass) once per substep, right after G2P — see diffuse-gpu.js.
         this.diffuse = null;
     }
 
@@ -489,36 +484,36 @@ export class FluidGPU {
         });
     }
 
-    simFrame(cmd, tsQuery = null) {
+    // All dispatches for every substep (CLEAR→COMPUTE_WEIGHTS→P2G_MASS→DECODE_MASS→
+    // P2G_MOM→UPDATE_GRID→[APPLY_HAND]→G2P→[diffuse generate→advect]) are recorded
+    // into a SINGLE compute pass. Within one pass, WebGPU guarantees dispatches run
+    // in submission order and that storage writes from an earlier dispatch are
+    // visible to a later one in the same pass (Dawn inserts barriers automatically
+    // via usage tracking) — so splitting stages into separate begin/end passes buys
+    // no correctness benefit here, only per-pass overhead. deleteNear()/raycastFluid()
+    // remain their own standalone passes (single dispatch, called outside simFrame).
+    simFrame(cmd) {
         const sub_dt = this.DT / this.SUBSTEPS;
         const wgP = Math.ceil(this.active_particle_num / WG_SIZE);
         const wgG = Math.ceil(this.grid_num / WG_SIZE);
         this._writeParamsBuffer(sub_dt);
 
+        const pass = cmd.beginComputePass();
         // `wg` is either a workgroup count (1D) or a [x,y,z] array (3D, used by
         // APPLY_HAND's bbox-sized dispatch — see updateHand()).
-        const run = (pip, bg, wg, beginTs, endTs) => {
-            const desc = {};
-            if (tsQuery !== null && (beginTs !== undefined || endTs !== undefined)) {
-                desc.timestampWrites = { querySet: tsQuery.querySet };
-                if (beginTs !== undefined) desc.timestampWrites.beginningOfPassWriteIndex = beginTs;
-                if (endTs   !== undefined) desc.timestampWrites.endOfPassWriteIndex       = endTs;
-            }
-            const pass = cmd.beginComputePass(desc);
+        const run = (pip, bg, wg) => {
             pass.setPipeline(pip); pass.setBindGroup(0, bg);
             if (Array.isArray(wg)) pass.dispatchWorkgroups(wg[0], wg[1], wg[2]);
             else pass.dispatchWorkgroups(wg);
-            pass.end();
         };
         for (let step = 0; step < this.SUBSTEPS; step++) {
-            const first = step === 0, last = step === this.SUBSTEPS - 1;
-            if (SIM_STAGE >= 1) run(this._clearPipeline,      this._clearBG,       wgG, first ? tsQuery?.beginIndex : undefined);
-            if (SIM_STAGE >= 2) run(this._computeWeightsPipeline, this._computeWeightsBG, wgP);
-            if (SIM_STAGE >= 3) run(this._p2gMassPipeline,   this._p2gMassBG,    wgP);
-            if (SIM_STAGE >= 4) run(this._decodeMassPipeline, this._decodeMassBG, wgG);
-            if (SIM_STAGE >= 5) run(this._p2gMomPipeline,     this._p2gMomBG,     wgP);
-            if (SIM_STAGE >= 6) run(this._updateGridPipeline, this._updateGridBG, wgG);
-            if (SIM_STAGE >= 6 && this.handActive) {
+            run(this._clearPipeline,      this._clearBG,       wgG);
+            run(this._computeWeightsPipeline, this._computeWeightsBG, wgP);
+            run(this._p2gMassPipeline,   this._p2gMassBG,    wgP);
+            run(this._decodeMassPipeline, this._decodeMassBG, wgG);
+            run(this._p2gMomPipeline,     this._p2gMomBG,     wgP);
+            run(this._updateGridPipeline, this._updateGridBG, wgG);
+            if (this.handActive) {
                 // Dispatched only over the (push cylinder ∩ grid) bbox computed in
                 // updateHand() — 4×4×4 matches WGSL_APPLY_HAND's workgroup_size.
                 const wgHX = Math.ceil(this._handBBoxDimX / 4);
@@ -528,8 +523,9 @@ export class FluidGPU {
                     run(this._applyHandPipeline, this._applyHandBG, [wgHX, wgHY, wgHZ]);
                 }
             }
-            if (SIM_STAGE >= 7) run(this._g2pPipeline,        this._g2pBG,        wgP, undefined, last ? tsQuery?.endIndex : undefined);
-            if (SIM_STAGE >= 8 && this.diffuse) this.diffuse.step(cmd, this.active_particle_num);
+            run(this._g2pPipeline,        this._g2pBG,        wgP);
+            if (this.diffuse) this.diffuse.step(pass, this.active_particle_num);
         }
+        pass.end();
     }
 }

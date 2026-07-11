@@ -134,30 +134,34 @@ export class DiffuseGPU {
     }
 
     // Called once per substep, right after G2P — mirrors the CPU's
-    // `diffuse.generate(fluid, sub_dt); diffuse.advect(fluid, sub_dt);`. Generate and
-    // advect must be separate dispatches in that order (not one fused pass): a
-    // particle spawned this substep should get exactly one advection step, matching
-    // the CPU call order, and running them concurrently would race a freshly-spawned
-    // slot against advect's alive-check for the same index.
-    step(cmd, activeParticleNum) {
+    // `diffuse.generate(fluid, sub_dt); diffuse.advect(fluid, sub_dt);`. Takes an
+    // already-open compute pass (fluid-gpu.js's simFrame() records its whole substep
+    // loop into one shared pass) rather than opening its own — WebGPU guarantees
+    // dispatches within a single pass execute in submission order with storage
+    // writes from earlier dispatches visible to later ones, so generate and advect
+    // just need to be two separate dispatchWorkgroups calls in that order (not
+    // fused into a single dispatch): a particle spawned this substep should get
+    // exactly one advection step, matching the CPU call order, and fusing them
+    // would race a freshly-spawned slot against advect's alive-check for the same
+    // index.
+    step(pass, activeParticleNum) {
         this._seed = (this._seed + 1) >>> 0;
         this._genU32[7] = this._seed;
+        // queue.writeBuffer is applied before any command-buffer submission executes
+        // (regardless of when it's called relative to pass recording), so this stays
+        // correct even though `pass` may already be open by the time we get here.
         this.device.queue.writeBuffer(this.genParamsBuffer, 28, this._genBuf, 28, 4);
 
         const wgGen = Math.ceil(activeParticleNum / WG_SIZE);
         const wgAdv = Math.ceil(this.maxCount / WG_SIZE);
 
-        const genPass = cmd.beginComputePass();
-        genPass.setPipeline(this._generatePipeline);
-        genPass.setBindGroup(0, this._generateBG);
-        genPass.dispatchWorkgroups(wgGen);
-        genPass.end();
+        pass.setPipeline(this._generatePipeline);
+        pass.setBindGroup(0, this._generateBG);
+        pass.dispatchWorkgroups(wgGen);
 
-        const advPass = cmd.beginComputePass();
-        advPass.setPipeline(this._advectPipeline);
-        advPass.setBindGroup(0, this._advectBG);
-        advPass.dispatchWorkgroups(wgAdv);
-        advPass.end();
+        pass.setPipeline(this._advectPipeline);
+        pass.setBindGroup(0, this._advectBG);
+        pass.dispatchWorkgroups(wgAdv);
     }
 
     // Optional debug readback of "how many diffuse particles are currently alive"

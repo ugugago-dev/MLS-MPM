@@ -750,6 +750,15 @@ fn kill_particle(i: u32) {
     free_list[u32(slot)] = i;
 }
 
+// Damped reflection off one axis' walls (x/z side walls, y_max ceiling).
+const DIFFUSE_RESTITUTION: f32 = 0.3;
+fn reflect_axis(p: f32, v: f32, lo: f32, hi: f32) -> vec2<f32> {
+    var np = p; var nv = v;
+    if (np < lo) { np = lo + (lo - np); nv = -nv * DIFFUSE_RESTITUTION; }
+    else if (np > hi) { np = hi - (np - hi); nv = -nv * DIFFUSE_RESTITUTION; }
+    return vec2<f32>(clamp(np, lo, hi), nv);
+}
+
 @compute @workgroup_size(${WG_SIZE})
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
@@ -781,16 +790,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     // Boundary: same [hard_min, hard_max] box as the main fluid's hard clamp.
-    // Same [hard_min, hard_max] box as the main fluid's hard clamp — any particle
-    // that exits it is killed outright (not reflected/clamped) so nothing ever
-    // renders outside the sim bounds.
-    let newPos = p.pos.xyz;
-    if (newPos.x < params.hard_min || newPos.x > params.hard_max_x ||
-        newPos.y < params.hard_min || newPos.y > params.hard_max_y ||
-        newPos.z < params.hard_min || newPos.z > params.hard_max_z) {
+    // Floor (y_min) despawns the particle (it has "landed"/been absorbed).
+    // Side walls (x/z) and the ceiling (y_max) reflect instead, since those
+    // exits are just simulation overshoot, not a natural resting place.
+    if (p.pos.y < params.hard_min) {
         kill_particle(i);
         return;
     }
+    let rx = reflect_axis(p.pos.x, p.vel.x, params.hard_min, params.hard_max_x);
+    let ry = reflect_axis(p.pos.y, p.vel.y, params.hard_min, params.hard_max_y);
+    let rz = reflect_axis(p.pos.z, p.vel.z, params.hard_min, params.hard_max_z);
+    p.pos = vec4<f32>(rx.x, ry.x, rz.x, 0.0);
+    p.vel = vec4<f32>(rx.y, ry.y, rz.y, 0.0);
 
     diffuse_particles[i] = p;
 }

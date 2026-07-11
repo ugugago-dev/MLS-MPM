@@ -1,4 +1,4 @@
-import { isMobile, dpr, DIFFUSE_MAX_COUNT, urlNum, urlFlag } from './config.js';
+import { isMobile, dpr, DIFFUSE_MAX_COUNT, urlNum } from './config.js';
 import { FluidGPU } from './fluid-gpu.js';
 import { DiffuseGPU } from './diffuse-gpu.js';
 import { initFluidRenderer } from './fluid-renderer.js';
@@ -13,20 +13,14 @@ import {
 // Fixed 1.8:2:1.8 domain — independent of screen orientation so portrait phones get the same grid size as landscape
 // Capacity is sized above the initial fillBlock() count (~100034 desktop / ~30213 mobile)
 // so there is headroom left for real-time spawnParticles() additions.
-// Diagnostic overrides (device-lost/TDR triage on mobile — see CLAUDE.md): ?p=<count>
-// forces the particle count regardless of isMobile; ?nodiffuse skips diffuse-particle
-// setup entirely. No params => identical to previous hardcoded behaviour.
-const particleCountDefault = isMobile ? 80000 : 200000;
-const particleCount = urlNum('p', particleCountDefault);
-const noDiffuse = urlFlag('nodiffuse');
-// ?nosim — skip simFrame() entirely (init + empty command buffer submit only).
-// Used to separate init-time crashes from per-frame-dispatch crashes on mobile
-// Vulkan drivers (VK_ERROR_OUT_OF_HOST_MEMORY triage — see CLAUDE.md).
-const noSim = urlFlag('nosim');
+// Diagnostic override (device-lost/TDR triage on mobile — see CLAUDE.md):
+// ?p=<count> forces the particle count regardless of isMobile.
+const particleCount = isMobile ? 80000 : 400000;
 
 const fluid = new FluidGPU(2, 2, 3, isMobile ? 0.0175 : 0.0125, particleCount);
-fluid.fillBlock(0.05, 0.05, 0.05, 0.95, 0.95, 0.45);
-const diffuse = noDiffuse ? null : new DiffuseGPU(DIFFUSE_MAX_COUNT);
+const spacing = 0.03;
+fluid.fillBlock(spacing, spacing, spacing, 1.0 - spacing, 1.0 - spacing, 0.4 - spacing);
+const diffuse = new DiffuseGPU(DIFFUSE_MAX_COUNT);
 
 // ─────────────────────────────────────────────────────────────
 //  Canvas / overlay setup
@@ -332,7 +326,7 @@ function startLoop(encodeRender) {
 
         let simSteps = 0;
         while (simAccum >= SIM_STEP_S && simSteps < MAX_SIM_STEPS) {
-            if (!noSim) fluid.simFrame(cmd);
+            fluid.simFrame(cmd);
             simAccum -= SIM_STEP_S;
             simSteps++;
         }
@@ -451,7 +445,7 @@ async function init() {
         if (info.reason !== "destroyed") {
             deviceLostRetries++;
             if (deviceLostRetries > MAX_DEVICE_LOST_RETRIES) {
-                showError(`GPU device lost x${deviceLostRetries} — giving up. Try ?p=20000, ?frs=0.25, ?rs=0.25, ?nodiffuse, ?nofxaa, ?nrf=1 to reduce load.`);
+                showError(`GPU device lost x${deviceLostRetries} — giving up. Try ?p=20000, ?frs=0.25, ?rs=0.25, ?nrf=1 to reduce load.`);
                 return;
             }
             // Non-sticky so a real init error on the retry can still replace it.
@@ -468,10 +462,8 @@ async function init() {
     device.pushErrorScope("out-of-memory");
 
     fluid.initGPU(device);
-    if (diffuse) {
-        diffuse.initGPU(device, fluid);
-        fluid.diffuse = diffuse;
-    }
+    diffuse.initGPU(device, fluid);
+    fluid.diffuse = diffuse;
 
     const fr = await initFluidRenderer(device, c, fluid.particlePosBuffer, fluid.particleVelBuffer, fluid.particleDensityBuffer, fluid.REST_DENSITY, diffuse);
 

@@ -14,4 +14,3 @@ export const DIFFUSE_MAX_COUNT = isMobile ? 12000 : 30000;
 // ─────────────────────────────────────────────────────────────
 const _q = new URLSearchParams(location.search);
 export function urlNum(key, def)  { const v = parseFloat(_q.get(key)); return Number.isFinite(v) ? v : def; }
-export function urlFlag(key)      { return _q.has(key); }

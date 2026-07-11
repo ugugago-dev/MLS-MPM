@@ -27,7 +27,7 @@
 // the old dedicated thickness blur (T2/T3) is gone. NRF_ITERATIONS=1 → 2 filter
 // passes total (1×H + 1×V), each writing both depth and thickness.
 
-import { urlNum, urlFlag } from './config.js';
+import { urlNum } from './config.js';
 
 // DEBUG_PASS_TIMING: per-render-pass GPU timestamp-query profiling, fully
 // self-contained in this file. Flip to false to strip it out completely — every
@@ -68,8 +68,7 @@ const FOAM_RES_SCALE   = 0.5;
 // Diagnostic URL override (?rs=0.25) — see CLAUDE.md / config.js urlNum.
 const RENDER_SCALE_DEFAULT = 0.5;
 const RENDER_SCALE = urlNum('rs', RENDER_SCALE_DEFAULT);
-// Diagnostic URL override (?nofxaa) — see CLAUDE.md / config.js urlFlag.
-const FXAA_ENABLED = !urlFlag('nofxaa');   // cheap luma-based AA applied in the upscale blit
+const FXAA_ENABLED = true;   // cheap luma-based AA applied in the upscale blit
 // Diagnostic URL override (?stage=N) — mobile GPU-driver-crash triage: enables render
 // passes up through stage N only (1=pass1 .. 9=blit), so a crash can be bisected to a
 // specific pass. stage=0 skips every render pass (sim-only). Default 99 = all passes
@@ -129,12 +128,11 @@ const WGSL_FULLSCREEN_VS = /* wgsl */`
     }
 `;
 
-// Summary of active diagnostic overrides for this module (frs/rs/nofxaa/nrf), for
+// Summary of active diagnostic overrides for this module (frs/rs/nrf/stage), for
 // display in main.js's on-screen debug overlay. Empty string when nothing was overridden.
 const _rendererOverrideParts = [];
 if (FLUID_RES_SCALE !== FLUID_RES_SCALE_DEFAULT) _rendererOverrideParts.push(`frs=${FLUID_RES_SCALE}`);
 if (RENDER_SCALE !== RENDER_SCALE_DEFAULT) _rendererOverrideParts.push(`rs=${RENDER_SCALE}`);
-if (!FXAA_ENABLED) _rendererOverrideParts.push('nofxaa');
 if (NRF_ITERATIONS !== NRF_ITERATIONS_DEFAULT) _rendererOverrideParts.push(`nrf=${NRF_ITERATIONS}`);
 if (RENDER_STAGE !== 99) _rendererOverrideParts.push(`stage=${RENDER_STAGE}`);
 export const RENDERER_OVERRIDES_TEXT = _rendererOverrideParts.join(' ');

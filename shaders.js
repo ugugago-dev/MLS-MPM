@@ -750,6 +750,16 @@ fn kill_particle(i: u32) {
     free_list[u32(slot)] = i;
 }
 
+// Damped reflection off one axis' walls; the final clamp catches reflection
+// overshoot when a particle is more than a wall-depth past the boundary.
+const DIFFUSE_RESTITUTION: f32 = 0.3;
+fn reflect_axis(p: f32, v: f32, lo: f32, hi: f32) -> vec2<f32> {
+    var np = p; var nv = v;
+    if (np < lo) { np = lo + (lo - np); nv = -nv * DIFFUSE_RESTITUTION; }
+    else if (np > hi) { np = hi - (np - hi); nv = -nv * DIFFUSE_RESTITUTION; }
+    return vec2<f32>(clamp(np, lo, hi), nv);
+}
+
 @compute @workgroup_size(${WG_SIZE})
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
@@ -780,12 +790,28 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         p.pos = vec4<f32>(pos3 + params.dt * p.vel.xyz, 0.0);
     }
 
-    let newPos = p.pos.xyz;
-    if (newPos.y < 0.0 || newPos.y > f32(params.grid_Y) ||
-        newPos.x < 0.0 || newPos.x > f32(params.grid_X) ||
-        newPos.z < 0.0 || newPos.z > f32(params.grid_Z)) {
-        kill_particle(i);
-        return;
+    // Boundary: same [hard_min, hard_max] box as the main fluid's hard clamp.
+    // - spray: damped reflection off side walls/ceiling; dies at the floor
+    //   ("absorbed"), which is its only death path — spray lifetime is
+    //   effectively infinite (999 in generate), so it must keep a sink here.
+    // - foam: follows grid velocity (no velocity of its own), so a position
+    //   clamp is enough — the grid field is already boundary-constrained.
+    // - bubble: reflection on all axes incl. floor (it must be able to rise).
+    let lo = vec3<f32>(params.hard_min);
+    let hi = vec3<f32>(params.hard_max_x, params.hard_max_y, params.hard_max_z);
+
+    if (p.ptype == DIFFUSE_FOAM) {
+        p.pos = vec4<f32>(clamp(p.pos.xyz, lo, hi), 0.0);
+    } else {
+        if (p.ptype == DIFFUSE_SPRAY && p.pos.y < lo.y) {
+            kill_particle(i);
+            return;
+        }
+        let rx = reflect_axis(p.pos.x, p.vel.x, lo.x, hi.x);
+        let ry = reflect_axis(p.pos.y, p.vel.y, lo.y, hi.y);
+        let rz = reflect_axis(p.pos.z, p.vel.z, lo.z, hi.z);
+        p.pos = vec4<f32>(rx.x, ry.x, rz.x, 0.0);
+        p.vel = vec4<f32>(rx.y, ry.y, rz.y, 0.0);
     }
 
     diffuse_particles[i] = p;

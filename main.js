@@ -1,7 +1,7 @@
-import { isMobile, dpr, DIFFUSE_MAX_COUNT } from './config.js';
+import { isMobile, dpr, DIFFUSE_MAX_COUNT, urlNum, urlFlag } from './config.js';
 import { FluidGPU } from './fluid-gpu.js';
 import { DiffuseGPU } from './diffuse-gpu.js';
-import { initFluidRenderer } from './fluid-renderer.js';
+import { initFluidRenderer, RENDERER_OVERRIDES_TEXT } from './fluid-renderer.js';
 import {
     mat4Perspective, mat4LookAt, mat4Multiply,
     cameraVectors, screenToWorld, worldToScreen, simBoundsOnScreen, rayBoxIntersect,
@@ -13,9 +13,21 @@ import {
 // Fixed 1.8:2:1.8 domain — independent of screen orientation so portrait phones get the same grid size as landscape
 // Capacity is sized above the initial fillBlock() count (~100034 desktop / ~30213 mobile)
 // so there is headroom left for real-time spawnParticles() additions.
-const fluid = new FluidGPU(2, 2, 3, isMobile ? 0.0175 : 0.0125, isMobile ? 80000 : 200000);
+// Diagnostic overrides (device-lost/TDR triage on mobile — see CLAUDE.md): ?p=<count>
+// forces the particle count regardless of isMobile; ?nodiffuse skips diffuse-particle
+// setup entirely. No params => identical to previous hardcoded behaviour.
+const particleCountDefault = isMobile ? 80000 : 200000;
+const particleCount = urlNum('p', particleCountDefault);
+const noDiffuse = urlFlag('nodiffuse');
+const overridesParts = [];
+if (particleCount !== particleCountDefault) overridesParts.push(`p=${particleCount}`);
+if (noDiffuse) overridesParts.push('nodiffuse');
+if (RENDERER_OVERRIDES_TEXT) overridesParts.push(RENDERER_OVERRIDES_TEXT);
+const overridesText = overridesParts.length ? `overrides: ${overridesParts.join(' ')}` : '';
+
+const fluid = new FluidGPU(2, 2, 3, isMobile ? 0.0175 : 0.0125, particleCount);
 fluid.fillBlock(0.05, 0.05, 0.05, 0.95, 0.95, 0.45);
-const diffuse = new DiffuseGPU(DIFFUSE_MAX_COUNT);
+const diffuse = noDiffuse ? null : new DiffuseGPU(DIFFUSE_MAX_COUNT);
 
 // ─────────────────────────────────────────────────────────────
 //  Canvas / overlay setup
@@ -250,18 +262,17 @@ function drawOverlay(cv, viewProj, frameMs) {
 
     octx.font = "14px monospace";
     octx.fillStyle = "#aaa";
-    octx.fillText(`frame: ${frameMs.toFixed(2)} ms`, 16, 28);
-    octx.fillText(`particles: ${fluid.active_particle_num}  diffuse: ${diffuse.aliveCount}`, 16, 46);
+    let ln = 0;
+    const nextY = () => 28 + 18 * ln++;
+    octx.fillText(`frame: ${frameMs.toFixed(2)} ms`, 16, nextY());
+    octx.fillText(`particles: ${fluid.active_particle_num}  diffuse: ${diffuse ? diffuse.aliveCount : 0}`, 16, nextY());
     if (gpuTimersActive) {
-        octx.fillText(`GPU sim: ${gpuSimMs.toFixed(2)} ms  render: ${gpuRenderMs.toFixed(2)} ms`, 16, 64);
-        octx.fillText(isMobile
-            ? `drag in sim: push  drag outside: orbit`
-            : `L-drag: push fluid  R-drag: orbit  wheel: zoom  E: add  R: remove`, 16, 82);
-    } else {
-        octx.fillText(isMobile
-            ? `drag in sim: push  drag outside: orbit`
-            : `L-drag: push fluid  R-drag: orbit  wheel: zoom  E: add  R: remove`, 16, 64);
+        octx.fillText(`GPU sim: ${gpuSimMs.toFixed(2)} ms  render: ${gpuRenderMs.toFixed(2)} ms`, 16, nextY());
     }
+    octx.fillText(isMobile
+        ? `drag in sim: push  drag outside: orbit`
+        : `L-drag: push fluid  R-drag: orbit  wheel: zoom  E: add  R: remove`, 16, nextY());
+    if (overridesText) octx.fillText(overridesText, 16, nextY());
 }
 
 function startLoop(encodeRender, tsRes) {
@@ -357,7 +368,7 @@ function startLoop(encodeRender, tsRes) {
         }
 
         debugFrameCounter++;
-        if (debugFrameCounter >= DEBUG_READBACK_INTERVAL) {
+        if (diffuse && debugFrameCounter >= DEBUG_READBACK_INTERVAL) {
             debugFrameCounter = 0;
             diffuse.requestDebugReadback(cmd);
         }
@@ -365,7 +376,7 @@ function startLoop(encodeRender, tsRes) {
         fluid.device.queue.submit([cmd.finish()]);
         fluid.pollDelete();
         fluid.pollRaycast();
-        diffuse.pollDebug();
+        if (diffuse) diffuse.pollDebug();
 
         if (tsRes && !tsPending) {
             tsPending = true;
@@ -457,6 +468,13 @@ function showError(err, sticky = true) {
 window.addEventListener("error", (e) => showError(e.error || e.message || "Uncaught error"));
 window.addEventListener("unhandledrejection", (e) => showError(e.reason || "Unhandled promise rejection"));
 
+// Device-lost auto-retry counter. Mobile GPUs can enter a lost/re-init loop
+// (TDR-style thrashing under too much load) that never recovers and just keeps
+// the device hot; cap retries so it gives up and tells the user to back off the
+// load via the diagnostic URL overrides above instead of looping forever.
+const MAX_DEVICE_LOST_RETRIES = 3;
+let deviceLostRetries = 0;
+
 async function init() {
     if (!navigator.gpu) throw new Error("WebGPU not supported.");
     const adapter = await navigator.gpu.requestAdapter();
@@ -475,8 +493,13 @@ async function init() {
     device.lost.then(async (info) => {
         if (_animFrameId !== null) { cancelAnimationFrame(_animFrameId); _animFrameId = null; }
         if (info.reason !== "destroyed") {
+            deviceLostRetries++;
+            if (deviceLostRetries > MAX_DEVICE_LOST_RETRIES) {
+                showError(`GPU device lost x${deviceLostRetries} — giving up. Try ?p=20000, ?frs=0.25, ?rs=0.25, ?nodiffuse, ?nofxaa, ?nrf=1 to reduce load.`);
+                return;
+            }
             // Non-sticky so a real init error on the retry can still replace it.
-            showError("GPU device lost (" + info.reason + "): " + info.message + " — retrying…", false);
+            showError(`GPU device lost (${info.reason}): ${info.message} — retrying… (${deviceLostRetries}/${MAX_DEVICE_LOST_RETRIES})`, false);
             await new Promise(r => setTimeout(r, 1000));
             init().catch(showError);
         }
@@ -489,8 +512,10 @@ async function init() {
     device.pushErrorScope("out-of-memory");
 
     fluid.initGPU(device);
-    diffuse.initGPU(device, fluid);
-    fluid.diffuse = diffuse;
+    if (diffuse) {
+        diffuse.initGPU(device, fluid);
+        fluid.diffuse = diffuse;
+    }
 
     const tsRes = supportsTs ? {
         querySet:      device.createQuerySet({ type: 'timestamp', count: 4 }),

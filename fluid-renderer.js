@@ -27,6 +27,8 @@
 // the old dedicated thickness blur (T2/T3) is gone. NRF_ITERATIONS=1 → 2 filter
 // passes total (1×H + 1×V), each writing both depth and thickness.
 
+import { urlNum, urlFlag } from './config.js';
+
 // DEBUG_PASS_TIMING: per-render-pass GPU timestamp-query profiling, fully
 // self-contained in this file. Flip to false to strip it out completely — every
 // piece of debug code below is gated on this flag (or on `dbgQuerySet` being
@@ -39,9 +41,11 @@ const PARTICLE_RADIUS  = 0.45;          // grid units
 const NRF_SIGMA        = 1.5  * PARTICLE_RADIUS;
 const NRF_DELTA        = 10.0 * PARTICLE_RADIUS;
 const NRF_MU           = 1  * PARTICLE_RADIUS;
-const NRF_ITERATIONS   = 2;             // NRF H+V iterations (each iter = 1×H + 1×V, MRT depth+thickness)
+const NRF_ITERATIONS_DEFAULT = 2;       // NRF H+V iterations (each iter = 1×H + 1×V, MRT depth+thickness)
                                         // 1 was tried for perf but graininess persisted (user-confirmed); filter
                                         // passes are not the render bottleneck anyway (6→2 passes bought ~0.1ms).
+// Diagnostic URL override (?nrf=1) — see CLAUDE.md / config.js urlNum. No param => unchanged default.
+const NRF_ITERATIONS   = urlNum('nrf', NRF_ITERATIONS_DEFAULT);
 const BG_DEPTH         = -1.0;          // sentinel for background pixels
 // Thickness-only fixed-radius Gaussian blur, run once after the NRF chain finishes
 // (separate from the NRF-MRT thickness blur above, which is tied to NRF_SIGMA and
@@ -51,7 +55,9 @@ const THICK_SMOOTH_SIGMA  = 3.0;
 const THICK_SMOOTH_RADIUS = Math.ceil(2 * THICK_SMOOTH_SIGMA);
 // Fluid screen-space resolution scale. 0.5 = half-res for pass1/T1/NRF chain
 // (shade upsamples back to full res). Set to 1.0 to roll back to full-res.
-const FLUID_RES_SCALE  = 0.5;
+// Diagnostic URL override (?frs=0.25) — see CLAUDE.md / config.js urlNum.
+const FLUID_RES_SCALE_DEFAULT = 0.5;
+const FLUID_RES_SCALE  = urlNum('frs', FLUID_RES_SCALE_DEFAULT);
 // Foam thickness resolution scale (unchanged: foam has always been half-res).
 // Kept as a named constant so the foam→fluid texel remapping (foam f_att) can be
 // derived from the FLUID_RES_SCALE / FOAM_RES_SCALE ratio instead of a hardcoded ×2.
@@ -59,8 +65,11 @@ const FOAM_RES_SCALE   = 0.5;
 // Final scene render scale. shade/spray/foam-composite render into an offscreen
 // scene texture at this scale of the swapchain, then one blit pass upscales it
 // bilinearly (+FXAA) to the display. 1.0 = render at native res (blit becomes AA-only).
-const RENDER_SCALE = 0.5;
-const FXAA_ENABLED = true;   // cheap luma-based AA applied in the upscale blit
+// Diagnostic URL override (?rs=0.25) — see CLAUDE.md / config.js urlNum.
+const RENDER_SCALE_DEFAULT = 0.5;
+const RENDER_SCALE = urlNum('rs', RENDER_SCALE_DEFAULT);
+// Diagnostic URL override (?nofxaa) — see CLAUDE.md / config.js urlFlag.
+const FXAA_ENABLED = !urlFlag('nofxaa');   // cheap luma-based AA applied in the upscale blit
 // FXAA tuning (baked into the blit shader; only used when FXAA_ENABLED). EDGE_*
 // gate the early-out (skip AA on low-contrast texels); the rest is the classic
 // FXAA3-console edge blend.
@@ -112,6 +121,15 @@ const WGSL_FULLSCREEN_VS = /* wgsl */`
         return vec4<f32>(p[vi], 0.0, 1.0);
     }
 `;
+
+// Summary of active diagnostic overrides for this module (frs/rs/nofxaa/nrf), for
+// display in main.js's on-screen debug overlay. Empty string when nothing was overridden.
+const _rendererOverrideParts = [];
+if (FLUID_RES_SCALE !== FLUID_RES_SCALE_DEFAULT) _rendererOverrideParts.push(`frs=${FLUID_RES_SCALE}`);
+if (RENDER_SCALE !== RENDER_SCALE_DEFAULT) _rendererOverrideParts.push(`rs=${RENDER_SCALE}`);
+if (!FXAA_ENABLED) _rendererOverrideParts.push('nofxaa');
+if (NRF_ITERATIONS !== NRF_ITERATIONS_DEFAULT) _rendererOverrideParts.push(`nrf=${NRF_ITERATIONS}`);
+export const RENDERER_OVERRIDES_TEXT = _rendererOverrideParts.join(' ');
 
 export async function initFluidRenderer(device, canvas, particlePosBuffer, particleVelBuffer, particleDensityBuffer, restDensity, diffuse = null) {
     const context = canvas.getContext("webgpu");

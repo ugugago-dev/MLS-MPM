@@ -70,6 +70,13 @@ const RENDER_SCALE_DEFAULT = 0.5;
 const RENDER_SCALE = urlNum('rs', RENDER_SCALE_DEFAULT);
 // Diagnostic URL override (?nofxaa) — see CLAUDE.md / config.js urlFlag.
 const FXAA_ENABLED = !urlFlag('nofxaa');   // cheap luma-based AA applied in the upscale blit
+// Diagnostic URL override (?stage=N) — mobile GPU-driver-crash triage: enables render
+// passes up through stage N only (1=pass1 .. 9=blit), so a crash can be bisected to a
+// specific pass. stage=0 skips every render pass (sim-only). Default 99 = all passes
+// (identical to previous behaviour). Passes are still validation-safe to skip: a
+// downstream pass reading a skipped upstream pass's texture just reads stale/cleared
+// data (no crash) — see CLAUDE.md for the exact stage→pass mapping.
+const RENDER_STAGE = urlNum('stage', 99);
 // FXAA tuning (baked into the blit shader; only used when FXAA_ENABLED). EDGE_*
 // gate the early-out (skip AA on low-contrast texels); the rest is the classic
 // FXAA3-console edge blend.
@@ -129,6 +136,7 @@ if (FLUID_RES_SCALE !== FLUID_RES_SCALE_DEFAULT) _rendererOverrideParts.push(`fr
 if (RENDER_SCALE !== RENDER_SCALE_DEFAULT) _rendererOverrideParts.push(`rs=${RENDER_SCALE}`);
 if (!FXAA_ENABLED) _rendererOverrideParts.push('nofxaa');
 if (NRF_ITERATIONS !== NRF_ITERATIONS_DEFAULT) _rendererOverrideParts.push(`nrf=${NRF_ITERATIONS}`);
+if (RENDER_STAGE !== 99) _rendererOverrideParts.push(`stage=${RENDER_STAGE}`);
 export const RENDERER_OVERRIDES_TEXT = _rendererOverrideParts.join(' ');
 
 export async function initFluidRenderer(device, canvas, particlePosBuffer, particleVelBuffer, particleDensityBuffer, restDensity, diffuse = null) {
@@ -1335,7 +1343,7 @@ export async function initFluidRenderer(device, canvas, particlePosBuffer, parti
         };
 
         // Pass 1: sphere impostor → raw linear depth
-        {
+        if (RENDER_STAGE >= 1) {
             const desc = {
                 colorAttachments: [{ view: rawV, clearValue: bgColor, loadOp: "clear", storeOp: "store" }],
                 depthStencilAttachment: { view: hwDV, depthClearValue: 1.0, depthLoadOp: "clear", depthStoreOp: "store" },
@@ -1356,7 +1364,7 @@ export async function initFluidRenderer(device, canvas, particlePosBuffer, parti
         }
 
         // Pass T1: thickness accumulation (all particles, no depth test, additive blend)
-        {
+        if (RENDER_STAGE >= 2) {
             const desc = {
                 colorAttachments: [{ view: thickRawV, clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: "clear", storeOp: "store" }],
             };
@@ -1375,18 +1383,20 @@ export async function initFluidRenderer(device, canvas, particlePosBuffer, parti
         // Iteration 1: source is raw
         // DEBUG_PASS_TIMING: bracket the entire NRF H+V×iterations span as one "nrf"
         // pass — begin on the very first H pass, end on the very last V pass.
-        runFilter(filterHPipeline, filterBG_raw,   filtAV, thickAV, dbgTWBegin('nrf'));
-        runFilter(filterVPipeline, filterBG_filtA, filtBV, thickBV, NRF_ITERATIONS === 1 ? dbgTWEnd('nrf') : undefined);
-        // Additional iterations ping-pong between filtB → filtA → filtB
-        for (let i = 1; i < NRF_ITERATIONS; i++) {
-            runFilter(filterHPipeline, filterBG_filtB, filtAV, thickAV);
-            runFilter(filterVPipeline, filterBG_filtA, filtBV, thickBV, i === NRF_ITERATIONS - 1 ? dbgTWEnd('nrf') : undefined);
+        if (RENDER_STAGE >= 3) {
+            runFilter(filterHPipeline, filterBG_raw,   filtAV, thickAV, dbgTWBegin('nrf'));
+            runFilter(filterVPipeline, filterBG_filtA, filtBV, thickBV, NRF_ITERATIONS === 1 ? dbgTWEnd('nrf') : undefined);
+            // Additional iterations ping-pong between filtB → filtA → filtB
+            for (let i = 1; i < NRF_ITERATIONS; i++) {
+                runFilter(filterHPipeline, filterBG_filtB, filtAV, thickAV);
+                runFilter(filterVPipeline, filterBG_filtA, filtBV, thickBV, i === NRF_ITERATIONS - 1 ? dbgTWEnd('nrf') : undefined);
+            }
         }
 
         // Pass ThB: thickness-only fixed-radius Gaussian blur (grid-frequency thickness
         // mottling cleanup, independent of NRF_SIGMA). thickB → thickA (H) → thickB (V);
         // thickATex is free scratch space here since the NRF chain above has finished.
-        {
+        if (RENDER_STAGE >= 4) {
             const passH = cmd.beginRenderPass({
                 colorAttachments: [{ view: thickAV, clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: "clear", storeOp: "store" }],
             });
@@ -1400,7 +1410,7 @@ export async function initFluidRenderer(device, canvas, particlePosBuffer, parti
 
         // Pass Nf: foam/bubble thickness accumulation (additive, reads filtBTex for
         // depth attenuation). Must run before shade so it can sample the fluid depth.
-        if (foamThickPipeline) {
+        if (foamThickPipeline && RENDER_STAGE >= 5) {
             const desc = {
                 colorAttachments: [{ view: foamThickRawV, clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: "clear", storeOp: "store" }],
             };
@@ -1415,7 +1425,7 @@ export async function initFluidRenderer(device, canvas, particlePosBuffer, parti
 
         // Shade pass: normal reconstruct → sceneColorTex (RENDER_SCALE). The final
         // upscale to the swapchain happens in the blit pass below.
-        {
+        if (RENDER_STAGE >= 6) {
             const desc = {
                 colorAttachments: [{ view: sceneColorV, clearValue: { r:0.08,g:0.08,b:0.08,a:1 }, loadOp: "clear", storeOp: "store" }],
             };
@@ -1427,7 +1437,7 @@ export async function initFluidRenderer(device, canvas, particlePosBuffer, parti
         // Diffuse particles: composited on top of the shaded fluid. Always draws
         // diffuse.maxCount instances — dead pool slots are NaN'd out in the vertex
         // shader (see diffuse-gpu.js for why the pool never shrinks the draw count).
-        if (diffusePipeline) {
+        if (diffusePipeline && RENDER_STAGE >= 7) {
             const desc = {
                 colorAttachments: [{ view: sceneColorV, loadOp: "load", storeOp: "store" }],
             };
@@ -1441,7 +1451,7 @@ export async function initFluidRenderer(device, canvas, particlePosBuffer, parti
         }
 
         // Pass Cf: composite accumulated foam over the shaded fluid + spray.
-        if (foamCompositePipeline) {
+        if (foamCompositePipeline && RENDER_STAGE >= 8) {
             const desc = {
                 colorAttachments: [{ view: sceneColorV, loadOp: "load", storeOp: "store" }],
             };
@@ -1456,7 +1466,7 @@ export async function initFluidRenderer(device, canvas, particlePosBuffer, parti
         // Pass Bl: upscale the RENDER_SCALE scene color → swapchain (bilinear + FXAA).
         // This is the only pass that writes the swapchain, so the external tsQuery's
         // end-of-render marker lands here (was on shade before the offscreen scene tex).
-        {
+        if (RENDER_STAGE >= 9) {
             const desc = {
                 colorAttachments: [{ view: colorV, clearValue: { r:0,g:0,b:0,a:1 }, loadOp: "clear", storeOp: "store" }],
             };

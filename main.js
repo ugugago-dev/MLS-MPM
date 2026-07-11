@@ -1,7 +1,7 @@
 import { isMobile, dpr, DIFFUSE_MAX_COUNT, urlNum, urlFlag } from './config.js';
 import { FluidGPU } from './fluid-gpu.js';
 import { DiffuseGPU } from './diffuse-gpu.js';
-import { initFluidRenderer, RENDERER_OVERRIDES_TEXT } from './fluid-renderer.js';
+import { initFluidRenderer } from './fluid-renderer.js';
 import {
     mat4Perspective, mat4LookAt, mat4Multiply,
     cameraVectors, screenToWorld, worldToScreen, simBoundsOnScreen, rayBoxIntersect,
@@ -19,11 +19,6 @@ import {
 const particleCountDefault = isMobile ? 80000 : 200000;
 const particleCount = urlNum('p', particleCountDefault);
 const noDiffuse = urlFlag('nodiffuse');
-const overridesParts = [];
-if (particleCount !== particleCountDefault) overridesParts.push(`p=${particleCount}`);
-if (noDiffuse) overridesParts.push('nodiffuse');
-if (RENDERER_OVERRIDES_TEXT) overridesParts.push(RENDERER_OVERRIDES_TEXT);
-const overridesText = overridesParts.length ? `overrides: ${overridesParts.join(' ')}` : '';
 
 const fluid = new FluidGPU(2, 2, 3, isMobile ? 0.0175 : 0.0125, particleCount);
 fluid.fillBlock(0.05, 0.05, 0.05, 0.95, 0.95, 0.45);
@@ -203,13 +198,8 @@ window.addEventListener("blur", () => { eKeyDown = false; rKeyDown = false; });
 // ─────────────────────────────────────────────────────────────
 let avgFrameMs = 0, lastFrameTime = performance.now();
 let _animFrameId = null;
-let gpuSimMs = 0, gpuRenderMs = 0, gpuTimersActive = false;
 // Reused each frame — read into ddx/ddy/ddz immediately below, never retained.
 const _cursorPos = [0, 0, 0];
-// diffuse.aliveCount only feeds the on-screen debug text, so its GPU readback
-// (copyBufferToBuffer + mapAsync) doesn't need to run every single frame.
-const DEBUG_READBACK_INTERVAL = 15;
-let debugFrameCounter = 0;
 
 function drawOverlay(cv, viewProj, frameMs) {
     octx.clearRect(0, 0, logicalW, logicalH);
@@ -265,22 +255,12 @@ function drawOverlay(cv, viewProj, frameMs) {
     let ln = 0;
     const nextY = () => 28 + 18 * ln++;
     octx.fillText(`frame: ${frameMs.toFixed(2)} ms`, 16, nextY());
-    octx.fillText(`particles: ${fluid.active_particle_num}  diffuse: ${diffuse ? diffuse.aliveCount : 0}`, 16, nextY());
-    if (gpuTimersActive) {
-        octx.fillText(`GPU sim: ${gpuSimMs.toFixed(2)} ms  render: ${gpuRenderMs.toFixed(2)} ms`, 16, nextY());
-    }
     octx.fillText(isMobile
         ? `drag in sim: push  drag outside: orbit`
         : `L-drag: push fluid  R-drag: orbit  wheel: zoom  E: add  R: remove`, 16, nextY());
-    if (overridesText) octx.fillText(overridesText, 16, nextY());
 }
 
-function startLoop(encodeRender, tsRes) {
-    const simTsq = tsRes ? { querySet: tsRes.querySet, beginIndex: 0, endIndex: 1 } : null;
-    const renTsq = tsRes ? { querySet: tsRes.querySet, beginIndex: 2, endIndex: 3 } : null;
-    let tsPending = false;
-    gpuTimersActive = !!tsRes;
-
+function startLoop(encodeRender) {
     // Fixed-timestep accumulator: run exactly enough simFrames per real second.
     // SIM_STEP_S = wall-clock interval for one simFrame (1/60 → 60 steps/sec at 60fps).
     // MAX_SIM_STEPS caps runaway when frames are slow (spiral-of-death prevention).
@@ -348,7 +328,7 @@ function startLoop(encodeRender, tsRes) {
 
         let simSteps = 0;
         while (simAccum >= SIM_STEP_S && simSteps < MAX_SIM_STEPS) {
-            fluid.simFrame(cmd, simSteps === 0 ? simTsq : null);
+            fluid.simFrame(cmd);
             simAccum -= SIM_STEP_S;
             simSteps++;
         }
@@ -360,36 +340,11 @@ function startLoop(encodeRender, tsRes) {
         // paying for a pile of extra catch-up steps on top of the recovery.
         const MAX_SIM_ACCUM = SIM_STEP_S * MAX_SIM_STEPS;
         if (simAccum > MAX_SIM_ACCUM) simAccum = MAX_SIM_ACCUM;
-        encodeRender(cmd, fluid.active_particle_num, cv, view, proj, viewProj, renTsq);
-
-        if (tsRes && !tsPending) {
-            cmd.resolveQuerySet(tsRes.querySet, 0, 4, tsRes.resolveBuffer, 0);
-            cmd.copyBufferToBuffer(tsRes.resolveBuffer, 0, tsRes.readBuffer, 0, 32);
-        }
-
-        debugFrameCounter++;
-        if (diffuse && debugFrameCounter >= DEBUG_READBACK_INTERVAL) {
-            debugFrameCounter = 0;
-            diffuse.requestDebugReadback(cmd);
-        }
+        encodeRender(cmd, fluid.active_particle_num, cv, view, proj, viewProj);
 
         fluid.device.queue.submit([cmd.finish()]);
         fluid.pollDelete();
         fluid.pollRaycast();
-        if (diffuse) diffuse.pollDebug();
-
-        if (tsRes && !tsPending) {
-            tsPending = true;
-            tsRes.readBuffer.mapAsync(GPUMapMode.READ).then(() => {
-                const ts = new BigUint64Array(tsRes.readBuffer.getMappedRange());
-                const simNs = ts[1] > ts[0] ? Number(ts[1] - ts[0]) : 0;
-                const renNs = ts[3] > ts[2] ? Number(ts[3] - ts[2]) : 0;
-                gpuSimMs    = gpuSimMs    * 0.9 + simNs / 1e6 * 0.1;
-                gpuRenderMs = gpuRenderMs * 0.9 + renNs / 1e6 * 0.1;
-                tsRes.readBuffer.unmap();
-                tsPending = false;
-            });
-        }
 
         const frameMs = frameStart - lastFrameTime;
         lastFrameTime = frameStart;
@@ -479,10 +434,7 @@ async function init() {
     if (!navigator.gpu) throw new Error("WebGPU not supported.");
     const adapter = await navigator.gpu.requestAdapter();
     if (!adapter) throw new Error("No GPU adapter.");
-    const supportsTs = adapter.features.has('timestamp-query');
-    const device = await adapter.requestDevice({
-        requiredFeatures: supportsTs ? ['timestamp-query'] : [],
-    });
+    const device = await adapter.requestDevice();
 
     // Surface WebGPU validation / out-of-memory errors that aren't thrown but
     // reported asynchronously (the usual reason a phone just shows a white frame:
@@ -517,12 +469,6 @@ async function init() {
         fluid.diffuse = diffuse;
     }
 
-    const tsRes = supportsTs ? {
-        querySet:      device.createQuerySet({ type: 'timestamp', count: 4 }),
-        resolveBuffer: device.createBuffer({ size: 32, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC }),
-        readBuffer:    device.createBuffer({ size: 32, usage: GPUBufferUsage.COPY_DST    | GPUBufferUsage.MAP_READ }),
-    } : null;
-
     const fr = await initFluidRenderer(device, c, fluid.particlePosBuffer, fluid.particleVelBuffer, fluid.particleDensityBuffer, fluid.REST_DENSITY, diffuse);
 
     const oomErr = await device.popErrorScope();       // innermost first
@@ -530,7 +476,7 @@ async function init() {
     if (valErr) { showError("Validation error during init: " + valErr.message); return; }
     if (oomErr) { showError("Out-of-memory during init: " + oomErr.message); return; }
 
-    startLoop((cmd, count, cv, view, proj, viewProj, renTsq) => fr(cmd, count, cv, view, proj, viewProj, renTsq), tsRes);
+    startLoop((cmd, count, cv, view, proj, viewProj) => fr(cmd, count, cv, view, proj, viewProj));
 }
 
 init().catch(showError);

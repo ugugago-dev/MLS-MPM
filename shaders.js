@@ -1,5 +1,9 @@
 import { WG_SIZE, MAX_WALLS } from './config.js';
 
+// 床バネ帯の幅 (セル、WGSL_G2Pに焼き込み)。経緯と「変えてはいけない値」はG2P内コメント参照。
+// レンダラーの床際ストレッチフェード幅 (STRETCH_FLOOR_FADE) はこの帯以上であれば可。
+const FLOOR_SPRING_BAND = 3.0;
+
 const WGSL_COMMON = /* wgsl */`
 // Cohesive (negative) EOS pressure floor, gated by density: fluid near rest
 // density keeps a slight cohesion for droplet cohesiveness, but sparse particles
@@ -106,17 +110,21 @@ fn hard_clamp_axis(p: f32, v: f32, lo: f32, hi: f32) -> vec2<f32> {
 // ── 動く壁 (AABB障害物) ────────────────────────────────────────────────
 // Movable AABB obstacles, coupled to the fluid via grid boundary conditions
 // (AABB IF-test in UPDATE_GRID + G2P). Layout kept in sync with fluid-gpu.js's
-// 192B uniform (MAX_WALLS × 48B) and the renderer's box pass (config.js MAX_WALLS
-// is the single source of truth for the count).
-// min_active.w = active flag: 0.0 = inactive (ignored everywhere), 1.0 = active.
-// "active" means w >= 0.5. vel is derived CPU-side each simFrame as
-// (new min − prev-frame min)/DT.
+// _writeWallParams uniform (16B header + MAX_WALLS × 48B; config.js MAX_WALLS is
+// the single source of truth for the capacity).
+// CPU側がactive壁のみを先頭詰めでパックし、個数を count_pad.x に書く。ホットパス
+// (全セル/全粒子×substep) のループが壁ゼロ時に即終了できるようにするため —
+// per-wall の activeフラグ+continue 方式より、最頻状態 (壁なし) の固定費が消える。
+// vel is derived CPU-side each simFrame as (new min − prev-frame min)/DT.
 struct Wall {
-    min_active : vec4<f32>,   // xyz = min corner,  w = active flag (0=off / 1=on)
-    max_pad    : vec4<f32>,   // xyz = max corner
-    vel_pad    : vec4<f32>,   // xyz = wall velocity (grid units / sim time)
+    min_pad : vec4<f32>,   // xyz = min corner
+    max_pad : vec4<f32>,   // xyz = max corner
+    vel_pad : vec4<f32>,   // xyz = wall velocity (grid units / sim time)
 }
-struct WallParams { walls: array<Wall, ${MAX_WALLS}> }
+struct WallParams {
+    count_pad : vec4<f32>,              // x = number of packed active walls
+    walls     : array<Wall, ${MAX_WALLS}>,
+}
 
 // AABB signed distance + outward normal, packed as vec4 (xyz = normal, w = sdf).
 // Outside (w > 0): normal points from the nearest box face toward the query point
@@ -133,9 +141,9 @@ fn wall_sdf_normal(p: vec3<f32>, mn: vec3<f32>, mx: vec3<f32>) -> vec4<f32> {
         // Outside on at least one axis: distance/normal from the nearest surface point.
         let nearest = clamp(p, mn, mx);
         let diff    = p - nearest;
-        let len     = length(diff);
+        let len     = length(diff);   // = distance to the box surface (|max(q,0)|)
         let n = select(vec3<f32>(0.0, 1.0, 0.0), diff / len, len > 1e-6);
-        return vec4<f32>(n, length(max(q, vec3<f32>(0.0))));
+        return vec4<f32>(n, len);
     }
     // Fully inside: qmax (the least-negative axis gap) is the shallowest penetration.
     var n = vec3<f32>(0.0, 1.0, 0.0);
@@ -439,11 +447,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     //    1セルなら全高で隙間~0に密着し、貫通・漏出もゼロ)。
     let cellPos = vec3<f32>(f32(cx) + 0.5, f32(cy) + 0.5, f32(cz) + 0.5);
     var wv = vec3<f32>(vx, vy, vz);
-    for (var wi = 0u; wi < ${MAX_WALLS}u; wi++) {
+    for (var wi = 0u; wi < u32(wallp.count_pad.x); wi++) {
         let wall = wallp.walls[wi];
-        if (wall.min_active.w < 0.5) { continue; }   // 非activeはスキップ
+        let mn   = wall.min_pad.xyz;
+        let mx   = wall.max_pad.xyz;
+        // 安価な棄却: 表面帯 (1セル) 込みの拡張AABBの外なら、SDF (sqrt/div) を払わず抜ける。
+        if (any(cellPos < mn - vec3<f32>(1.0)) || any(cellPos > mx + vec3<f32>(1.0))) { continue; }
         let wvel = wall.vel_pad.xyz;
-        let sn   = wall_sdf_normal(cellPos, wall.min_active.xyz, wall.max_pad.xyz);
+        let sn   = wall_sdf_normal(cellPos, mn, mx);
         if (sn.w < 0.0) {
             wv = wvel;
         } else if (sn.w < 1.0) {
@@ -584,29 +595,27 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var np = pos + params.dt * vec3<f32>(gvx, gvy, gvz);
     var nv = vec3<f32>(gvx, gvy, gvz);
 
-    // 床バネ (Splash方式): 予測位置ベースの常時バネ補正、ただし帯は床上「1セル」のみ。
-    // 帯幅の履歴 (ヘッドレスA/B計測済み、2026-07-18):
-    //  - 3セル (旧): 「バネ vs 水圧」の釣り合いで静止高さが水深依存になる — 薄い水は床から
-    //    ~1.4セル浮き、深い水柱の底は y≈2 まで沈む → 壁を挟んで左右の底面高さがズレて見えた
-    //  - 食い込み時のみ (一時試行): 底面は均一になるがクッションを失い、全粒子が y=2.0 の同一
-    //    平面にパンケーキ化→底セルの密度スパイクをEOSが弾き、薄い層で縦振動 (vyMax 3.4倍)
-    //  - 1セル: ヘッドレス指標は良好だったが実機で薄層の振動が残った (ユーザー確認)
-    //  - 2セル (現行): 実機の目視判断で採用。~2セル厚以上の層なら自重で釣り合いが潰れ切り
-    //    底面は水深によらず y≈2 で均一 (ヘッドレス確認済み)。1セル未満の極薄シートはやや
-    //    浮きうるが許容。3セルに戻さないこと
-    let floorZoneY = params.hard_min + 2.0;
+    // 床バネ (Splash方式): 予測位置ベースの常時バネ補正、帯は FLOOR_SPRING_BAND=3セル。
+    // 帯幅の試行履歴 (2026-07-18、いずれもNGで3セルに確定 — 縮めないこと):
+    //  - 食い込み時のみ: クッション喪失で全粒子が y=2.0 にパンケーキ化→底セルの密度スパイク
+    //    をEOSが弾き、薄い層が縦振動 (実機確認)
+    //  - 1セル・2セル: いずれも実機で薄層の縦振動が残った (ヘッドレスの振動RMS指標では
+    //    差が出ない=この知覚的ジッタの検出には使えない、実機目視が正)
+    //  - 3セル (現行): 振動なし。代償として静止高さが「バネvs水圧」の釣り合いで水深依存になり、
+    //    薄い水は床から~1.4セル浮く (壁を挟んだ深い側と浅い側で底面高さがズレて見える)。
+    //    この底面差はユーザー判断で許容済み (振動の方が有害)
+    let floorZoneY = params.hard_min + ${FLOOR_SPRING_BAND.toFixed(1)};
     let xn = np + nv * params.dt * params.lookahead_k;
     if (xn.y < floorZoneY) {
         let distBelowFloor = floorZoneY - xn.y;
-        let blend = clamp(distBelowFloor / 2.0, 0.0, 1.0);
+        let blend = clamp(distBelowFloor / ${FLOOR_SPRING_BAND.toFixed(1)}, 0.0, 1.0);
         nv.y += params.wall_stiffness * blend * distBelowFloor;
     }
 
     // 動く壁 (AABB) の押し出し。床バネと同じ場所 (ハードクランプの前) で生のnp/nvを使う。
-    for (var wi = 0u; wi < ${MAX_WALLS}u; wi++) {
+    for (var wi = 0u; wi < u32(wallp.count_pad.x); wi++) {
         let wall = wallp.walls[wi];
-        if (wall.min_active.w < 0.5) { continue; }   // 非activeのみスキップ
-        let wmin = wall.min_active.xyz;
+        let wmin = wall.min_pad.xyz;
         let wmax = wall.max_pad.xyz;
         let wvel = wall.vel_pad.xyz;
 
@@ -616,9 +625,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // 不自然に狭く見える (上ほど広い=不均一)。外壁・床と同じく定常時の安定化は
         // UPDATE_GRID のIF速度帯に任せ、粒子は壁面に密着させる (全高で隙間ゼロ=均一)。
         // lookahead があるので、動く壁へ突っ込む粒子は実接触の前に減速される。
+        // どちらの補正も結果を使うのは「内部 (sdf<0)」のときだけなので、SDFのフル計算
+        // (clamp/sqrt/div) の前に6比較の内包テストを置き、壁の外の大多数の粒子を素通しする。
         let xnw = np + nv * params.dt * params.lookahead_k;
-        let sxn = wall_sdf_normal(xnw, wmin, wmax);
-        if (sxn.w < 0.0) {
+        if (all(xnw > wmin) && all(xnw < wmax)) {
+            let sxn   = wall_sdf_normal(xnw, wmin, wmax);
             let dist  = -sxn.w;
             let blend = clamp(dist / params.wall_min, 0.0, 1.0);
             nv += sxn.xyz * (params.wall_stiffness * blend * dist);
@@ -630,8 +641,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // すると界面に密度スパイクが立ち、EOS圧力が粒子を吹き上げる自励噴出ループになる。
         // 0.5セル/ステップの漸進排出なら圧力場が追従できる (深く埋まった粒子のテレポートによる
         // 密度スパイク噴出を防ぐ汎用の安定化)。
-        let snp = wall_sdf_normal(np, wmin, wmax);
-        if (snp.w < 0.0) {
+        if (all(np > wmin) && all(np < wmax)) {
+            let snp = wall_sdf_normal(np, wmin, wmax);
             np = np - snp.xyz * max(snp.w, -0.5);
             let vn = dot(nv - wvel, snp.xyz);
             if (vn < 0.0) { nv -= vn * snp.xyz; }
@@ -905,19 +916,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // 動く壁 (AABB) に入った diffuse 粒子を最も浅い貫通軸で押し出し、その軸(=法線)方向の
     // 速度成分を減衰反射 (外壁の reflect_axis と同じ DIFFUSE_RESTITUTION、壁速度基準)。
     // 全active壁 (w >= 0.5) に適用。diffuse は装飾トレーサーで壁を突き抜けると見栄えが悪い。
-    for (var wi = 0u; wi < ${MAX_WALLS}u; wi++) {
+    for (var wi = 0u; wi < u32(wallp.count_pad.x); wi++) {
         let wall = wallp.walls[wi];
-        if (wall.min_active.w < 0.5) { continue; }
-        let sn = wall_sdf_normal(p.pos.xyz, wall.min_active.xyz, wall.max_pad.xyz);
-        if (sn.w < 0.0) {
-            p.pos = vec4<f32>(p.pos.xyz - sn.xyz * sn.w, 0.0);   // 最近傍表面へ押し出し
-            let wvel = wall.vel_pad.xyz;
-            let vrel = p.vel.xyz - wvel;
-            let vn   = dot(vrel, sn.xyz);
-            if (vn < 0.0) {
-                let newvrel = vrel - (1.0 + DIFFUSE_RESTITUTION) * vn * sn.xyz;
-                p.vel = vec4<f32>(wvel + newvrel, 0.0);
-            }
+        let mn   = wall.min_pad.xyz;
+        let mx   = wall.max_pad.xyz;
+        // 押し出しは内部 (sdf<0) のときだけなので、フルSDFの前に安価な内包テストを置く。
+        if (!(all(p.pos.xyz > mn) && all(p.pos.xyz < mx))) { continue; }
+        let sn = wall_sdf_normal(p.pos.xyz, mn, mx);
+        p.pos = vec4<f32>(p.pos.xyz - sn.xyz * sn.w, 0.0);   // 最近傍表面へ押し出し
+        let wvel = wall.vel_pad.xyz;
+        let vrel = p.vel.xyz - wvel;
+        let vn   = dot(vrel, sn.xyz);
+        if (vn < 0.0) {
+            let newvrel = vrel - (1.0 + DIFFUSE_RESTITUTION) * vn * sn.xyz;
+            p.vel = vec4<f32>(wvel + newvrel, 0.0);
         }
     }
 

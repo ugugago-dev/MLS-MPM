@@ -62,12 +62,10 @@ export function cameraVectors(cam, out = { eye: [0, 0, 0], right: [0, 0, 0], up:
     return out;
 }
 
-// Unproject screen pixel (CSS pixels) onto the plane through cam.target. `out` is an
-// optional caller-owned [x,y,z] to write into instead of allocating — pass a reused
-// scratch array from a per-frame hot path. Defaults to a fresh allocation; callers that
-// retain the returned array across frames (e.g. assigning it into persistent state)
-// must keep using the default rather than passing a shared scratch buffer.
-export function screenToWorld(sx, sy, logicalW, logicalH, cam, cv, out = [0, 0, 0]) {
+// Normalized direction of the pointer ray (origin = cv.eye) through a screen pixel
+// (CSS pixels). `out` is an optional caller-owned [x,y,z] to write into instead of
+// allocating — pass a reused scratch array from a per-frame/per-event hot path.
+export function screenToWorldRay(sx, sy, logicalW, logicalH, cam, cv, out = [0, 0, 0]) {
     const ndcX = (sx / logicalW) * 2 - 1;
     const ndcY = 1 - (sy / logicalH) * 2;
     const aspect = logicalW / logicalH;
@@ -75,18 +73,43 @@ export function screenToWorld(sx, sy, logicalW, logicalH, cam, cv, out = [0, 0, 
     const thH = thV * aspect;
     const fx = cam.target[0] - cv.eye[0], fy = cam.target[1] - cv.eye[1], fz = cam.target[2] - cv.eye[2];
     const fl = Math.hypot(fx, fy, fz) || 1;
-    const fdx = fx / fl, fdy = fy / fl, fdz = fz / fl;
-    let rdx = fdx + ndcX * thH * cv.right[0] + ndcY * thV * cv.up[0];
-    let rdy = fdy + ndcX * thH * cv.right[1] + ndcY * thV * cv.up[1];
-    let rdz = fdz + ndcX * thH * cv.right[2] + ndcY * thV * cv.up[2];
+    const rdx = fx / fl + ndcX * thH * cv.right[0] + ndcY * thV * cv.up[0];
+    const rdy = fy / fl + ndcX * thH * cv.right[1] + ndcY * thV * cv.up[1];
+    const rdz = fz / fl + ndcX * thH * cv.right[2] + ndcY * thV * cv.up[2];
     const rl = Math.hypot(rdx, rdy, rdz) || 1;
-    rdx /= rl; rdy /= rl; rdz /= rl;
-    const denom = rdx * fdx + rdy * fdy + rdz * fdz;
-    if (Math.abs(denom) < 1e-6) { out[0] = cam.target[0]; out[1] = cam.target[1]; out[2] = cam.target[2]; return out; }
-    const ttx = cam.target[0] - cv.eye[0], tty = cam.target[1] - cv.eye[1], ttz = cam.target[2] - cv.eye[2];
-    const t = (ttx * fdx + tty * fdy + ttz * fdz) / denom;
-    out[0] = cv.eye[0] + t * rdx; out[1] = cv.eye[1] + t * rdy; out[2] = cv.eye[2] + t * rdz;
+    out[0] = rdx / rl; out[1] = rdy / rl; out[2] = rdz / rl;
     return out;
+}
+
+// Unproject screen pixel (CSS pixels) onto the plane through cam.target. `out` is an
+// optional caller-owned [x,y,z] to write into instead of allocating — pass a reused
+// scratch array from a per-frame hot path. Defaults to a fresh allocation; callers that
+// retain the returned array across frames (e.g. assigning it into persistent state)
+// must keep using the default rather than passing a shared scratch buffer.
+const _s2wDir = new Float32Array(3);
+export function screenToWorld(sx, sy, logicalW, logicalH, cam, cv, out = [0, 0, 0]) {
+    const d = screenToWorldRay(sx, sy, logicalW, logicalH, cam, cv, _s2wDir);
+    const fx = cam.target[0] - cv.eye[0], fy = cam.target[1] - cv.eye[1], fz = cam.target[2] - cv.eye[2];
+    const fl = Math.hypot(fx, fy, fz) || 1;
+    const denom = (d[0] * fx + d[1] * fy + d[2] * fz) / fl;
+    if (Math.abs(denom) < 1e-6) { out[0] = cam.target[0]; out[1] = cam.target[1]; out[2] = cam.target[2]; return out; }
+    // (target - eye)·forward̂ = |target - eye|, so the plane hit is at t = fl / denom.
+    const t = fl / denom;
+    out[0] = cv.eye[0] + t * d[0]; out[1] = cv.eye[1] + t * d[1]; out[2] = cv.eye[2] + t * d[2];
+    return out;
+}
+
+// Ray/plane intersection: origin + t*dir where the plane passes through `planePoint`
+// with normal `planeNormal`. Writes into `out`; returns false (out untouched) if the
+// ray runs parallel to the plane.
+export function rayPlaneIntersect(origin, dir, planePoint, planeNormal, out) {
+    const denom = dir[0] * planeNormal[0] + dir[1] * planeNormal[1] + dir[2] * planeNormal[2];
+    if (Math.abs(denom) < 1e-6) return false;
+    const t = ((planePoint[0] - origin[0]) * planeNormal[0]
+             + (planePoint[1] - origin[1]) * planeNormal[1]
+             + (planePoint[2] - origin[2]) * planeNormal[2]) / denom;
+    out[0] = origin[0] + t * dir[0]; out[1] = origin[1] + t * dir[1]; out[2] = origin[2] + t * dir[2];
+    return true;
 }
 
 export function worldToScreen(pos, viewProj, w, h) {

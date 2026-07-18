@@ -89,11 +89,12 @@ const FXAA_REDUCE_MIN    = 1.0 / 128.0;
 const THICKNESS_ABSORPTION = [0.05, 0.02, 0.005]; // per world-unit RGB absorption (tune to taste)
 const STRETCH_SENSITIVITY = 0.15;        // velocity → stretch sensitivity (larger = stretches more easily)
 const STRETCH_MAX         = 1.5;        // max additional elongation (total = 1 + STRETCH_MAX)
-// Floor spring-correction zone (must match FluidGPU.HARD_MIN / WALL_MIN in fluid-gpu.js):
-// below HARD_MIN+WALL_MIN the G2P floor spring inflates particle vy, so the render
-// stretch fades its vertical component to zero toward the floor.
+// Floor spring-correction zone: below the G2P floor-spring band the sim inflates
+// particle vy, so the render stretch fades its vertical component toward the floor.
+// MIN must match FluidGPU.HARD_MIN. FADE only needs to be >= the sim's band width
+// (shaders.js FLOOR_SPRING_BAND, currently 2.0) — wider just fades a little extra.
 const STRETCH_FLOOR_MIN  = 2.0;  // = FluidGPU.HARD_MIN
-const STRETCH_FLOOR_FADE = 3.0;  // = FluidGPU.WALL_MIN (fade band height)
+const STRETCH_FLOOR_FADE = 3.0;  // >= shaders.js FLOOR_SPRING_BAND (fade band height)
 
 // Diffuse particle look, indexed by ptype (0=spray, 1=foam, 2=bubble). Sizes are
 // relative to PARTICLE_RADIUS; no NRF/thickness treatment — these are drawn as
@@ -136,6 +137,19 @@ const WGSL_FULLSCREEN_VS = /* wgsl */`
     @vertex fn vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
         let p = array<vec2<f32>,3>(vec2<f32>(-1,-1), vec2<f32>(3,-1), vec2<f32>(-1,3));
         return vec4<f32>(p[vi], 0.0, 1.0);
+    }
+`;
+
+// Linear-depth occlusion test shared by the spray / foam-composite / wall shaders
+// (spliced in like WGSL_FULLSCREEN_VS): does depth `d` sampled from a linear-depth
+// texture (filtBTex / wallLinDepthTex) occlude a fragment at depth `dep`? The `> 0`
+// guard skips background pixels (BG_DEPTH = -1 clear, or 0 from a fresh texture).
+// LIN_DEPTH_EPS hides half-res depth quantisation at fluid/particle silhouettes;
+// surface-vs-surface comparisons (foam clip vs wall) pass eps = 0 instead.
+const WGSL_LIN_DEPTH_OCCLUDES = /* wgsl */`
+    const LIN_DEPTH_EPS: f32 = 0.05;
+    fn lin_depth_occludes(d: f32, dep: f32, eps: f32) -> bool {
+        return d > 0.0 && d < dep - eps;
     }
 `;
 
@@ -708,6 +722,7 @@ export async function initFluidRenderer(device, canvas, particlePosBuffer, parti
     let diffusePipeline = null;
     if (diffuse) {
         const diffuseShader = device.createShaderModule({ code: /* wgsl */`
+            ${WGSL_LIN_DEPTH_OCCLUDES}
             struct U {
                 viewProj : mat4x4<f32>, view : mat4x4<f32>, proj : mat4x4<f32>,
                 camRight : vec3<f32>, halfSize : f32,
@@ -816,13 +831,12 @@ export async function initFluidRenderer(device, canvas, particlePosBuffer, parti
                 // RENDER_SCALE → full-res px, × FLUID_RES_SCALE → fluid texel.
                 let coord      = vec2<i32>(in.pos.xy * (${FLUID_RES_SCALE} / ${RENDER_SCALE}));
                 let fluidDepth = textureLoad(depthTex, coord, 0).r;
-                if (fluidDepth > 0.0 && fluidDepth < dep - 0.05) { discard; }
+                if (lin_depth_occludes(fluidDepth, dep, LIN_DEPTH_EPS)) { discard; }
 
                 // Occlude against movable walls: wallLinDepthTex is at RENDER_SCALE (same
-                // res as this pass), so no coord remap — sample it directly. Background /
-                // fluid-occluded wall pixels are BG_DEPTH(-1), so the >0 guard skips them.
+                // res as this pass), so no coord remap — sample it directly.
                 let wallDepth = textureLoad(wallTex, vec2<i32>(in.pos.xy), 0).r;
-                if (wallDepth > 0.0 && wallDepth < dep - 0.05) { discard; }
+                if (lin_depth_occludes(wallDepth, dep, LIN_DEPTH_EPS)) { discard; }
 
                 return vec4<f32>(in.color, in.alpha);
             }
@@ -1036,6 +1050,7 @@ export async function initFluidRenderer(device, canvas, particlePosBuffer, parti
         });
 
         const foamCompositeShader = device.createShaderModule({ code: /* wgsl */`
+            ${WGSL_LIN_DEPTH_OCCLUDES}
             struct FU {
                 proj      : mat4x4<f32>,
                 screenRes : vec2<f32>,
@@ -1067,9 +1082,9 @@ export async function initFluidRenderer(device, canvas, particlePosBuffer, parti
                 // Occlude against movable walls: foam is pinned to the fluid surface, so
                 // clip it where a wall face is nearer than that surface. wallLinDepthTex is
                 // at RENDER_SCALE (this pass's res), so sample it directly with fragPos.
-                // BG_DEPTH(-1) wall pixels fail the >0 guard = no clipping.
+                // eps = 0: surface-vs-surface comparison, no silhouette quantisation to hide.
                 let wallDepth = textureLoad(wallTex, vec2<i32>(fragPos.xy), 0).r;
-                if (wallDepth > 0.0 && wallDepth < fluidDepth) { discard; }
+                if (lin_depth_occludes(wallDepth, fluidDepth, 0.0)) { discard; }
 
                 let re   = pow(rho, ${FOAM_RHO_EXP});
                 let iota = re / (${FOAM_RHO_MOD} + re);
@@ -1197,10 +1212,14 @@ export async function initFluidRenderer(device, canvas, particlePosBuffer, parti
     // Per wall: boxMin (vec4, .xyz used) + boxMax (vec4, .w = active flag) = 32 bytes.
     const wallUniBuf = device.createBuffer({ size: MAX_WALLS * 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     const wallUni    = new Float32Array(MAX_WALLS * 8);   // [minx,miny,minz,_, maxx,maxy,maxz,active] ×MAX_WALLS
-    const wallCache  = new Float32Array(MAX_WALLS * 8);    // last-uploaded snapshot for the dirty check
-    let wallUniInit  = false;                              // force the first upload even if all-zero
+    // Last-uploaded snapshot for the dirty check; NaN-filled so the first setWalls()
+    // always uploads (NaN ≠ NaN — same trick as fluid-gpu.js's _wallPrevF32).
+    const wallCache  = new Float32Array(MAX_WALLS * 8).fill(NaN);
+    let wallsVisible = false;      // encode Pass W this frame? (active now, or was last frame)
+    let wallsVisiblePrev = false;  // active state seen by the previous setWalls()
 
     const wallShader = device.createShaderModule({ code: /* wgsl */`
+        ${WGSL_LIN_DEPTH_OCCLUDES}
         struct U {
             viewProj : mat4x4<f32>, view : mat4x4<f32>, proj : mat4x4<f32>,
             camRight : vec3<f32>, halfSize : f32,
@@ -1273,7 +1292,7 @@ export async function initFluidRenderer(device, canvas, particlePosBuffer, parti
             // fragment when the (opaque) fluid surface is nearer than it.
             let coord      = vec2<i32>(in.pos.xy * (${FLUID_RES_SCALE} / ${RENDER_SCALE}));
             let fluidDepth = textureLoad(depthTex, coord, 0).r;   // background = -1.0
-            if (fluidDepth > 0.0 && fluidDepth < in.dep - 0.05) { discard; }
+            if (lin_depth_occludes(fluidDepth, in.dep, LIN_DEPTH_EPS)) { discard; }
 
             let n     = normalize(in.normal);
             let ldir  = normalize(vec3<f32>(${WALL_LIGHT_DIR.join(", ")}));
@@ -1465,26 +1484,26 @@ export async function initFluidRenderer(device, canvas, particlePosBuffer, parti
     // its extents), but active=0 makes the VS collapse the instance to a degenerate.
     // Uploads to the GPU uniform only when the packed data differs from the last upload.
     function setWalls(walls) {
+        let anyActive = false;
         for (let i = 0; i < MAX_WALLS; i++) {
             const b = i * 8;
-            const w = walls && walls[i];
-            if (w) {
-                wallUni[b]     = w.min[0]; wallUni[b + 1] = w.min[1]; wallUni[b + 2] = w.min[2];
-                wallUni[b + 3] = 0;
-                wallUni[b + 4] = w.max[0]; wallUni[b + 5] = w.max[1]; wallUni[b + 6] = w.max[2];
-                wallUni[b + 7] = w.active ? 1 : 0;
-            } else {
-                for (let k = 0; k < 8; k++) wallUni[b + k] = 0;
-            }
+            const w = walls[i];   // fluid.walls is always a full MAX_WALLS-length array
+            wallUni[b]     = w.min[0]; wallUni[b + 1] = w.min[1]; wallUni[b + 2] = w.min[2];
+            wallUni[b + 3] = 0;
+            wallUni[b + 4] = w.max[0]; wallUni[b + 5] = w.max[1]; wallUni[b + 6] = w.max[2];
+            wallUni[b + 7] = w.active ? 1 : 0;
+            if (w.active) anyActive = true;
         }
+        // Pass W runs while a wall is visible, plus one extra frame after the last
+        // one disappears so the pass's loadOp:clear resets wallLinDepthTex to
+        // BG_DEPTH (otherwise stale wall depths would keep occluding spray/foam).
+        wallsVisible = anyActive || wallsVisiblePrev;
+        wallsVisiblePrev = anyActive;
         // Dirty check against the last-uploaded snapshot (same pattern as paramsBuffer).
-        let dirty = !wallUniInit;
-        if (!dirty) {
-            for (let k = 0; k < wallUni.length; k++) { if (wallUni[k] !== wallCache[k]) { dirty = true; break; } }
-        }
+        let dirty = false;
+        for (let k = 0; k < wallUni.length; k++) { if (wallUni[k] !== wallCache[k]) { dirty = true; break; } }
         if (dirty) {
             wallCache.set(wallUni);
-            wallUniInit = true;
             device.queue.writeBuffer(wallUniBuf, 0, wallUni);
         }
     }
@@ -1640,7 +1659,11 @@ export async function initFluidRenderer(device, canvas, particlePosBuffer, parti
         // cleared to BG_DEPTH so wall-free / fluid-covered pixels read as "no wall",
         // and is consumed by the spray + foam-composite passes for wall occlusion.
         // Gated with the shade stage (6): walls are part of the "solid scene".
-        if (RENDER_STAGE >= 6) {
+        // Skipped entirely while no wall is active (the default state) — setWalls()
+        // keeps wallsVisible true for one extra frame after the last wall disappears
+        // so this pass's clear resets wallLinDepthTex; a freshly (re)created texture
+        // is zero-filled, which the spray/foam `> 0` guards also read as "no wall".
+        if (RENDER_STAGE >= 6 && wallsVisible) {
             const pass = cmd.beginRenderPass({
                 colorAttachments: [
                     { view: sceneColorV,   loadOp: "load", storeOp: "store" },

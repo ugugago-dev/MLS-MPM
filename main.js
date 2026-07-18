@@ -4,7 +4,8 @@ import { DiffuseGPU } from './diffuse-gpu.js';
 import { initFluidRenderer } from './fluid-renderer.js';
 import {
     mat4Perspective, mat4LookAt, mat4Multiply,
-    cameraVectors, screenToWorld, worldToScreen, simBoundsOnScreen, rayBoxIntersect,
+    cameraVectors, screenToWorld, screenToWorldRay, rayPlaneIntersect,
+    worldToScreen, simBoundsOnScreen, rayBoxIntersect,
 } from './math.js';
 
 // ─────────────────────────────────────────────────────────────
@@ -100,23 +101,11 @@ const wallDrag = {
     forward: new Float32Array(3), planePoint: new Float32Array(3),
     startHit: new Float32Array(3), startMin: new Float32Array(3), startMax: new Float32Array(3),
 };
-const _wallRayPt  = [0, 0, 0];       // scratch for screenToWorld() during wall drag
 const _wallRayDir = new Float32Array(3);
 const _wallHit    = new Float32Array(3);
 const _wallNewMin = new Float32Array(3), _wallNewMax = new Float32Array(3);
 const _wallHardMax = new Float32Array(3); // [HARD_MAX_X, HARD_MAX_Y, HARD_MAX_Z], filled once below
 _wallHardMax[0] = fluid.HARD_MAX_X; _wallHardMax[1] = fluid.HARD_MAX_Y; _wallHardMax[2] = fluid.HARD_MAX_Z;
-
-// Ray/plane intersection: eye + t*dir where the plane passes through `point` with
-// normal `forward`. Writes into `out`; returns false (out untouched) if the ray runs
-// parallel to the plane (near-impossible for a view-aligned plane facing the camera).
-function rayPlaneIntersect(eye, dir, point, forward, out) {
-    const denom = dir[0] * forward[0] + dir[1] * forward[1] + dir[2] * forward[2];
-    if (Math.abs(denom) < 1e-6) return false;
-    const t = ((point[0] - eye[0]) * forward[0] + (point[1] - eye[1]) * forward[1] + (point[2] - eye[2]) * forward[2]) / denom;
-    out[0] = eye[0] + t * dir[0]; out[1] = eye[1] + t * dir[1]; out[2] = eye[2] + t * dir[2];
-    return true;
-}
 
 // Shared camera-frame computation — used by both the pointerdown handler (to
 // project the sim bounds for the mobile orbit-vs-push heuristic) and the main loop
@@ -195,11 +184,7 @@ window.addEventListener("blur", () => { eKeyDown = false; rKeyDown = false; });
             wallDrag.planePoint[1] = (w.min[1] + w.max[1]) * 0.5;
             wallDrag.planePoint[2] = (w.min[2] + w.max[2]) * 0.5;
 
-            const p0 = screenToWorld(e.offsetX, e.offsetY, logicalW, logicalH, camera, cv, _wallRayPt);
-            let dx = p0[0] - cv.eye[0], dy = p0[1] - cv.eye[1], dz = p0[2] - cv.eye[2];
-            const dl = Math.hypot(dx, dy, dz) || 1;
-            _wallRayDir[0] = dx / dl; _wallRayDir[1] = dy / dl; _wallRayDir[2] = dz / dl;
-
+            screenToWorldRay(e.offsetX, e.offsetY, logicalW, logicalH, camera, cv, _wallRayDir);
             if (rayPlaneIntersect(cv.eye, _wallRayDir, wallDrag.planePoint, wallDrag.forward, wallDrag.startHit)) {
                 wallDrag.startMin.set(w.min); wallDrag.startMax.set(w.max);
                 wallDrag.active = true; wallDrag.pointerId = e.pointerId;
@@ -246,11 +231,7 @@ window.addEventListener("blur", () => { eKeyDown = false; rKeyDown = false; });
         lastPointerX = e.offsetX; lastPointerY = e.offsetY;
         if (wallDrag.active && e.pointerId === wallDrag.pointerId) {
             const cv = cameraVectors(camera, _camCv);
-            const p1 = screenToWorld(e.offsetX, e.offsetY, logicalW, logicalH, camera, cv, _wallRayPt);
-            let dx = p1[0] - cv.eye[0], dy = p1[1] - cv.eye[1], dz = p1[2] - cv.eye[2];
-            const dl = Math.hypot(dx, dy, dz) || 1;
-            _wallRayDir[0] = dx / dl; _wallRayDir[1] = dy / dl; _wallRayDir[2] = dz / dl;
-
+            screenToWorldRay(e.offsetX, e.offsetY, logicalW, logicalH, camera, cv, _wallRayDir);
             if (rayPlaneIntersect(cv.eye, _wallRayDir, wallDrag.planePoint, wallDrag.forward, _wallHit)) {
                 // World-space offset since drag start, clamped per axis so the moved
                 // AABB stays within the hard sim bounds (size fixed — position only).
@@ -306,8 +287,8 @@ window.addEventListener("blur", () => { eKeyDown = false; rKeyDown = false; });
 // ─────────────────────────────────────────────────────────────
 let avgFrameMs = 0, lastFrameTime = performance.now();
 let _animFrameId = null;
-// Reused each frame — read into ddx/ddy/ddz immediately below, never retained.
-const _cursorPos = [0, 0, 0];
+// Reused each frame for the E/R aim ray — consumed synchronously, never retained.
+const _cursorDir = new Float32Array(3);
 
 function drawOverlay(cv, viewProj, frameMs) {
     octx.clearRect(0, 0, logicalW, logicalH);
@@ -401,10 +382,7 @@ function startLoop(encodeRender) {
         // this is depth-independent, like APPLY_HAND's push, and stays correct
         // regardless of where the fluid surface actually sits along that ray.
         if (spawnState.active || deleteState.active) {
-            const cursorPos = screenToWorld(lastPointerX, lastPointerY, logicalW, logicalH, camera, cv, _cursorPos);
-            const ddx = cursorPos[0] - cv.eye[0], ddy = cursorPos[1] - cv.eye[1], ddz = cursorPos[2] - cv.eye[2];
-            const dl  = Math.hypot(ddx, ddy, ddz) || 1;
-            const dir = [ddx / dl, ddy / dl, ddz / dl];
+            const dir = screenToWorldRay(lastPointerX, lastPointerY, logicalW, logicalH, camera, cv, _cursorDir);
 
             if (deleteState.active) {
                 fluid.deleteNear(cmd, cv.eye, dir, deleteState.radius);

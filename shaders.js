@@ -584,15 +584,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var np = pos + params.dt * vec3<f32>(gvx, gvy, gvz);
     var nv = vec3<f32>(gvx, gvy, gvz);
 
-    // Splash方式: 予測位置ベースの弱いバネ補正 (ref/boundary-condition-splash-style.md ステップ3)
-    // 床(Y-min)からwall_min(3マス)の高さまでのゾーンに絞る。ハードクランプ「より前」の
-    // 生のnp/nvを使う。Y >= floorZoneY で補正なし、floorZoneY から hard_min に向かって線形に補正強度を増やす。
-    let floorZoneY = params.hard_min + params.wall_min;
+    // 床バネ (Splash方式): 予測位置ベースの常時バネ補正、ただし帯は床上「1セル」のみ。
+    // 帯幅の履歴 (ヘッドレスA/B計測済み、2026-07-18):
+    //  - 3セル (旧): 「バネ vs 水圧」の釣り合いで静止高さが水深依存になる — 薄い水は床から
+    //    ~1.4セル浮き、深い水柱の底は y≈2 まで沈む → 壁を挟んで左右の底面高さがズレて見えた
+    //  - 食い込み時のみ (一時試行): 底面は均一になるがクッションを失い、全粒子が y=2.0 の同一
+    //    平面にパンケーキ化→底セルの密度スパイクをEOSが弾き、薄い層で縦振動 (vyMax 3.4倍)
+    //  - 1セル (現行): 層の自重だけで釣り合いが潰れて底面は水深によらず y≈2 で均一、かつ
+    //    クッション維持で薄層のスパイクは旧3セルと同水準。3セルに戻さないこと
+    let floorZoneY = params.hard_min + 1.0;
     let xn = np + nv * params.dt * params.lookahead_k;
     if (xn.y < floorZoneY) {
-        let zoneHeight = floorZoneY - params.hard_min;
         let distBelowFloor = floorZoneY - xn.y;
-        let blend = clamp(distBelowFloor / zoneHeight, 0.0, 1.0);
+        let blend = clamp(distBelowFloor / 1.0, 0.0, 1.0);
         nv.y += params.wall_stiffness * blend * distBelowFloor;
     }
 

@@ -61,6 +61,63 @@ const handState = {
     radius: 6.0, strength: 1, active: false,
 };
 
+// ─────────────────────────────────────────────────────────────
+//  Movable wall (wall 0 only — W toggles it, Shift+L-drag moves it)
+// ─────────────────────────────────────────────────────────────
+// setWall()/removeWall() write straight to a GPU buffer (no command encoder involved,
+// same pattern as fluid.updateHand() below), so they're safe to call directly from
+// input handlers rather than deferring to the sim loop. Guard on fluid.device so a
+// stray keypress/drag before init() finishes (GPU not ready yet, fluid.walls may not
+// even be populated) is a no-op instead of a crash.
+const wall0Min = new Float32Array(3), wall0Max = new Float32Array(3);
+function toggleWall0() {
+    if (!fluid.device) return;
+    if (fluid.walls[0].active) {
+        fluid.removeWall(0);
+        return;
+    }
+    // Initial shape: a slab perpendicular to Z, 3 cells thick, straddling the grid
+    // center; spans the full X depth and most of the height (floor margin to 85%).
+    // Z-perpendicular because the default camera (theta=π/2) looks down the X axis:
+    // screen-horizontal = Z, so Shift+drag sweeps the wall sideways through the tank
+    // (an X-perpendicular slab would face the camera full-frame and its only visible
+    // travel direction, Z, is already spanned — the clamp would pin it in place).
+    const czc = fluid.grid_Z_num / 2;
+    wall0Min[0] = fluid.HARD_MIN;   wall0Max[0] = fluid.HARD_MAX_X;
+    wall0Min[1] = fluid.HARD_MIN;   wall0Max[1] = fluid.grid_Y_num * 0.85;
+    wall0Min[2] = czc - 1.5;        wall0Max[2] = czc + 1.5;
+    fluid.setWall(0, wall0Min, wall0Max);
+}
+
+// Drag state for moving wall 0: the plane is fixed at drag start (view-direction normal
+// through the wall's center at that moment), and every subsequent pointer move
+// re-intersects the pointer ray with that same plane to get a world-space delta —
+// added to the wall's start AABB (position only; size never changes during a drag).
+// All scratch arrays below are pre-allocated and reused every pointerdown/move, per the
+// project's no-per-frame/per-event-allocation convention (see computeCameraFrame above).
+const wallDrag = {
+    active: false, pointerId: null,
+    forward: new Float32Array(3), planePoint: new Float32Array(3),
+    startHit: new Float32Array(3), startMin: new Float32Array(3), startMax: new Float32Array(3),
+};
+const _wallRayPt  = [0, 0, 0];       // scratch for screenToWorld() during wall drag
+const _wallRayDir = new Float32Array(3);
+const _wallHit    = new Float32Array(3);
+const _wallNewMin = new Float32Array(3), _wallNewMax = new Float32Array(3);
+const _wallHardMax = new Float32Array(3); // [HARD_MAX_X, HARD_MAX_Y, HARD_MAX_Z], filled once below
+_wallHardMax[0] = fluid.HARD_MAX_X; _wallHardMax[1] = fluid.HARD_MAX_Y; _wallHardMax[2] = fluid.HARD_MAX_Z;
+
+// Ray/plane intersection: eye + t*dir where the plane passes through `point` with
+// normal `forward`. Writes into `out`; returns false (out untouched) if the ray runs
+// parallel to the plane (near-impossible for a view-aligned plane facing the camera).
+function rayPlaneIntersect(eye, dir, point, forward, out) {
+    const denom = dir[0] * forward[0] + dir[1] * forward[1] + dir[2] * forward[2];
+    if (Math.abs(denom) < 1e-6) return false;
+    const t = ((point[0] - eye[0]) * forward[0] + (point[1] - eye[1]) * forward[1] + (point[2] - eye[2]) * forward[2]) / denom;
+    out[0] = eye[0] + t * dir[0]; out[1] = eye[1] + t * dir[1]; out[2] = eye[2] + t * dir[2];
+    return true;
+}
+
 // Shared camera-frame computation — used by both the pointerdown handler (to
 // project the sim bounds for the mobile orbit-vs-push heuristic) and the main loop
 // (for rendering/aiming). Writes into persistent scratch matrices/objects instead of
@@ -99,6 +156,7 @@ window.addEventListener("keydown", (e) => {
     if (e.repeat) return;
     if (e.key === "e" || e.key === "E") eKeyDown = true;
     if (e.key === "r" || e.key === "R") rKeyDown = true;
+    if (e.key === "w" || e.key === "W") toggleWall0();
 });
 window.addEventListener("keyup", (e) => {
     if (e.key === "e" || e.key === "E") eKeyDown = false;
@@ -123,6 +181,35 @@ window.addEventListener("blur", () => { eKeyDown = false; rKeyDown = false; });
     overlay.addEventListener("pointerdown", (e) => {
         const aspect  = c.width / c.height;
         const { cv, viewProj: vp } = computeCameraFrame(aspect);
+
+        // Shift+left-drag moves wall 0 when it's active — checked first so this branch
+        // preempts both the push (iact) and orbit handling below; falls through to the
+        // normal push if the wall isn't active (per spec: no active wall = normal drag).
+        if (e.button === 0 && e.shiftKey && fluid.walls[0].active) {
+            const fx = camera.target[0] - cv.eye[0], fy = camera.target[1] - cv.eye[1], fz = camera.target[2] - cv.eye[2];
+            const fl = Math.hypot(fx, fy, fz) || 1;
+            wallDrag.forward[0] = fx / fl; wallDrag.forward[1] = fy / fl; wallDrag.forward[2] = fz / fl;
+
+            const w = fluid.walls[0];
+            wallDrag.planePoint[0] = (w.min[0] + w.max[0]) * 0.5;
+            wallDrag.planePoint[1] = (w.min[1] + w.max[1]) * 0.5;
+            wallDrag.planePoint[2] = (w.min[2] + w.max[2]) * 0.5;
+
+            const p0 = screenToWorld(e.offsetX, e.offsetY, logicalW, logicalH, camera, cv, _wallRayPt);
+            let dx = p0[0] - cv.eye[0], dy = p0[1] - cv.eye[1], dz = p0[2] - cv.eye[2];
+            const dl = Math.hypot(dx, dy, dz) || 1;
+            _wallRayDir[0] = dx / dl; _wallRayDir[1] = dy / dl; _wallRayDir[2] = dz / dl;
+
+            if (rayPlaneIntersect(cv.eye, _wallRayDir, wallDrag.planePoint, wallDrag.forward, wallDrag.startHit)) {
+                wallDrag.startMin.set(w.min); wallDrag.startMax.set(w.max);
+                wallDrag.active = true; wallDrag.pointerId = e.pointerId;
+                overlay.setPointerCapture(e.pointerId);
+                e.preventDefault();
+                return;
+            }
+            // Degenerate ray (parallel to the drag plane) — bail out to normal handling
+            // below rather than leaving the pointer captured with nothing to drag.
+        }
 
         // On mobile, tapping outside the projected simulation box triggers orbit instead of push.
         let wantOrbit = e.button === 2;
@@ -157,6 +244,28 @@ window.addEventListener("blur", () => { eKeyDown = false; rKeyDown = false; });
 
     overlay.addEventListener("pointermove", (e) => {
         lastPointerX = e.offsetX; lastPointerY = e.offsetY;
+        if (wallDrag.active && e.pointerId === wallDrag.pointerId) {
+            const cv = cameraVectors(camera, _camCv);
+            const p1 = screenToWorld(e.offsetX, e.offsetY, logicalW, logicalH, camera, cv, _wallRayPt);
+            let dx = p1[0] - cv.eye[0], dy = p1[1] - cv.eye[1], dz = p1[2] - cv.eye[2];
+            const dl = Math.hypot(dx, dy, dz) || 1;
+            _wallRayDir[0] = dx / dl; _wallRayDir[1] = dy / dl; _wallRayDir[2] = dz / dl;
+
+            if (rayPlaneIntersect(cv.eye, _wallRayDir, wallDrag.planePoint, wallDrag.forward, _wallHit)) {
+                // World-space offset since drag start, clamped per axis so the moved
+                // AABB stays within the hard sim bounds (size fixed — position only).
+                for (let i = 0; i < 3; i++) {
+                    let delta = _wallHit[i] - wallDrag.startHit[i];
+                    const lo = fluid.HARD_MIN - wallDrag.startMin[i];
+                    const hi = _wallHardMax[i] - wallDrag.startMax[i];
+                    if (delta < lo) delta = lo; else if (delta > hi) delta = hi;
+                    _wallNewMin[i] = wallDrag.startMin[i] + delta;
+                    _wallNewMax[i] = wallDrag.startMax[i] + delta;
+                }
+                fluid.setWall(0, _wallNewMin, _wallNewMax);
+            }
+            return;
+        }
         if (orbit.active && e.pointerId === orbit.pointerId) {
             const dx = e.clientX - orbit.lastX, dy = e.clientY - orbit.lastY;
             orbit.lastX = e.clientX; orbit.lastY = e.clientY;
@@ -181,6 +290,7 @@ window.addEventListener("blur", () => { eKeyDown = false; rKeyDown = false; });
             handState.active = false; handState.vel[0] = handState.vel[1] = handState.vel[2] = 0;
         }
         if (e.pointerId === orbit.pointerId) { orbit.active = false; orbit.pointerId = null; }
+        if (e.pointerId === wallDrag.pointerId) { wallDrag.active = false; wallDrag.pointerId = null; }
     };
     overlay.addEventListener("pointerup",     endPointer);
     overlay.addEventListener("pointercancel", endPointer);
@@ -254,8 +364,8 @@ function drawOverlay(cv, viewProj, frameMs) {
     const nextY = () => 28 + 18 * ln++;
     octx.fillText(`frame: ${frameMs.toFixed(2)} ms`, 16, nextY());
     octx.fillText(isMobile
-        ? `drag in sim: push  drag outside: orbit`
-        : `L-drag: push fluid  R-drag: orbit  wheel: zoom  E: add  R: remove`, 16, nextY());
+        ? `drag in sim: push  drag outside: orbit  W: toggle wall`
+        : `L-drag: push fluid  R-drag: orbit  wheel: zoom  E: add  R: remove  W: toggle wall  Shift+L-drag: move wall`, 16, nextY());
 }
 
 function startLoop(encodeRender) {
@@ -472,7 +582,12 @@ async function init() {
     if (valErr) { showError("Validation error during init: " + valErr.message); return; }
     if (oomErr) { showError("Out-of-memory during init: " + oomErr.message); return; }
 
-    startLoop((cmd, count, cv, view, proj, viewProj) => fr(cmd, count, cv, view, proj, viewProj));
+    startLoop((cmd, count, cv, view, proj, viewProj) => {
+        // Push the current wall AABBs to the renderer right before drawing — cheap
+        // per-frame sync, no allocation on either side (renderer reads fluid.walls in place).
+        fr.setWalls(fluid.walls);
+        fr(cmd, count, cv, view, proj, viewProj);
+    });
 }
 
 init().catch(showError);

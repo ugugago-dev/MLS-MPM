@@ -8,8 +8,10 @@
 //           scratch buffer; it's free once the NRF chain above is done) [FLUID_RES_SCALE res]
 // Pass Nf : foam/bubble thickness accumulation → r16float (foamThickRawTex, FOAM_RES_SCALE res, additive)
 // Pass N  : normal reconstruct + shade → sceneColorTex (RENDER_SCALE res; upsamples FLUID_RES_SCALE filtB/thickB; 9×9 NRF cleanup inlined)
-// Pass Sp : spray billboards → sceneColorTex (load; manual occlusion vs filtBTex)
-// Pass Cf : foam composite → sceneColorTex (load; bilinear upsample, density→opacity sigmoid; discards outside the filtBTex fluid silhouette)
+// Pass W  : movable wall AABB boxes → sceneColorTex (load) + wallLinDepthTex (r16float,
+//           MRT target1; wall linear depth for spray/foam occlusion) [RENDER_SCALE res]
+// Pass Sp : spray billboards → sceneColorTex (load; manual occlusion vs filtBTex AND wallLinDepthTex)
+// Pass Cf : foam composite → sceneColorTex (load; bilinear upsample, density→opacity sigmoid; discards outside the filtBTex fluid silhouette or behind a nearer wall face)
 // Pass Bl : blit → swapchain (bilinear upscale of sceneColorTex + optional FXAA)
 //
 // Two independent resolution knobs:
@@ -27,7 +29,7 @@
 // the old dedicated thickness blur (T2/T3) is gone. NRF_ITERATIONS=1 → 2 filter
 // passes total (1×H + 1×V), each writing both depth and thickness.
 
-import { urlNum } from './config.js';
+import { urlNum, MAX_WALLS } from './config.js';
 
 // DEBUG_PASS_TIMING: per-render-pass GPU timestamp-query profiling, fully
 // self-contained in this file. Flip to false to strip it out completely — every
@@ -117,6 +119,15 @@ const FOAM_ETA_MAX     = 8.0;   // depth diff (grid units) at which foam behind 
 const FOAM_ETA_N       = 1.0;
 const FOAM_ETA_M       = 1.0;
 const FOAM_COLOR       = [1.0, 1.0, 1.0];
+
+// Movable wall obstacles (AABB boxes, up to MAX_WALLS). Drawn as opaque geometry
+// right after the shade pass (see Pass W in render()). Flat-shaded: single base
+// colour + per-face Lambert (AABB → face normal is the ±axis) plus a constant
+// ambient term. Baked into the wall shader via template literals, same flavour as
+// the NRF_*/FOAM_* blocks above.
+const WALL_COLOR     = [0.72, 0.74, 0.78];   // base grey
+const WALL_AMBIENT   = 0.4;                  // ambient floor (0..1) added under the Lambert term
+const WALL_LIGHT_DIR = [0.4, 0.85, 0.35];    // world-space light direction (normalised in-shader)
 
 // Fullscreen-triangle vertex shader shared by every screen-space pass (NRF H/V,
 // thickness adaptive blur, shade, foam composite) — spliced into each shader
@@ -704,7 +715,8 @@ export async function initFluidRenderer(device, canvas, particlePosBuffer, parti
                 tanHalfFovY : f32, aspect : f32, zNear : f32, zFar : f32,
             };
             @group(0) @binding(0) var<uniform> u        : U;
-            @group(0) @binding(1) var          depthTex : texture_2d<f32>;
+            @group(0) @binding(1) var          depthTex : texture_2d<f32>;   // filtBTex (fluid depth), FLUID_RES_SCALE
+            @group(0) @binding(2) var          wallTex  : texture_2d<f32>;   // wallLinDepthTex (wall depth), RENDER_SCALE
 
             struct VsOut {
                 @builtin(position) pos    : vec4<f32>,
@@ -805,6 +817,12 @@ export async function initFluidRenderer(device, canvas, particlePosBuffer, parti
                 let coord      = vec2<i32>(in.pos.xy * (${FLUID_RES_SCALE} / ${RENDER_SCALE}));
                 let fluidDepth = textureLoad(depthTex, coord, 0).r;
                 if (fluidDepth > 0.0 && fluidDepth < dep - 0.05) { discard; }
+
+                // Occlude against movable walls: wallLinDepthTex is at RENDER_SCALE (same
+                // res as this pass), so no coord remap — sample it directly. Background /
+                // fluid-occluded wall pixels are BG_DEPTH(-1), so the >0 guard skips them.
+                let wallDepth = textureLoad(wallTex, vec2<i32>(in.pos.xy), 0).r;
+                if (wallDepth > 0.0 && wallDepth < dep - 0.05) { discard; }
 
                 return vec4<f32>(in.color, in.alpha);
             }
@@ -1005,13 +1023,15 @@ export async function initFluidRenderer(device, canvas, particlePosBuffer, parti
         // binding 0: screenRes uniform (reuses filterUniBuf), binding 1: foam thickness,
         // binding 2: filtering sampler, binding 3: filtBTex (fluid depth, for silhouette
         // clipping — background pixels behind/outside the fluid must not show foam that
-        // the bilinear upsample smeared past the fluid's edge).
+        // the bilinear upsample smeared past the fluid's edge), binding 4: wallLinDepthTex
+        // (wall depth, so foam sitting on the fluid surface is clipped by a nearer wall face).
         foamCompositeBGL = device.createBindGroupLayout({
             entries: [
                 { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: {} },
                 { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
                 { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } },
                 { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "unfilterable-float" } },
+                { binding: 4, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "unfilterable-float" } },
             ],
         });
 
@@ -1024,7 +1044,8 @@ export async function initFluidRenderer(device, canvas, particlePosBuffer, parti
             @group(0) @binding(0) var<uniform> u        : FU;
             @group(0) @binding(1) var          foamTex  : texture_2d<f32>;
             @group(0) @binding(2) var          foamSamp : sampler;
-            @group(0) @binding(3) var          depthTex : texture_2d<f32>;
+            @group(0) @binding(3) var          depthTex : texture_2d<f32>;   // filtBTex (fluid depth), FLUID_RES_SCALE
+            @group(0) @binding(4) var          wallTex  : texture_2d<f32>;   // wallLinDepthTex (wall depth), RENDER_SCALE
 
             ${WGSL_FULLSCREEN_VS}
 
@@ -1042,6 +1063,13 @@ export async function initFluidRenderer(device, canvas, particlePosBuffer, parti
                 let coord = vec2<i32>(fragPos.xy * (${FLUID_RES_SCALE} / ${RENDER_SCALE}));
                 let fluidDepth = textureLoad(depthTex, coord, 0).r;
                 if (fluidDepth < 0.0) { discard; }
+
+                // Occlude against movable walls: foam is pinned to the fluid surface, so
+                // clip it where a wall face is nearer than that surface. wallLinDepthTex is
+                // at RENDER_SCALE (this pass's res), so sample it directly with fragPos.
+                // BG_DEPTH(-1) wall pixels fail the >0 guard = no clipping.
+                let wallDepth = textureLoad(wallTex, vec2<i32>(fragPos.xy), 0).r;
+                if (wallDepth > 0.0 && wallDepth < fluidDepth) { discard; }
 
                 let re   = pow(rho, ${FOAM_RHO_EXP});
                 let iota = re / (${FOAM_RHO_MOD} + re);
@@ -1153,6 +1181,119 @@ export async function initFluidRenderer(device, canvas, particlePosBuffer, parti
         primitive: { topology: "triangle-list" },
     });
 
+    // ── Pass W: movable wall obstacles (AABB boxes) ───────────────────────
+    // Vertex-pulling: no vertex buffer. Each instance is one wall (instance_index),
+    // each drawing 36 vertices (12 triangles) of a unit cube remapped into the wall's
+    // [boxMin,boxMax] AABB; inactive walls collapse to a clipped degenerate. Rendered
+    // into sceneColorTex (RENDER_SCALE) with its OWN small depth buffer for correct
+    // wall-vs-wall ordering (this composite chain otherwise has no depth attachment).
+    // Fluid occlusion is manual (v1): a wall fragment behind the fluid surface (fluid
+    // is ~opaque via Beer-Lambert) is discarded, sampling filtBTex exactly like the
+    // spray-occlusion FS. Refraction of the fluid through the wall is out of scope.
+    //
+    // Camera uniforms reuse particleUniBuf (same 256-byte U layout as the shade pass,
+    // so screenRes is available for the filtBTex remap). Wall AABB data lives in its
+    // own uniform buffer, uploaded only when setWalls() sees a change (dirty check).
+    // Per wall: boxMin (vec4, .xyz used) + boxMax (vec4, .w = active flag) = 32 bytes.
+    const wallUniBuf = device.createBuffer({ size: MAX_WALLS * 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    const wallUni    = new Float32Array(MAX_WALLS * 8);   // [minx,miny,minz,_, maxx,maxy,maxz,active] ×MAX_WALLS
+    const wallCache  = new Float32Array(MAX_WALLS * 8);    // last-uploaded snapshot for the dirty check
+    let wallUniInit  = false;                              // force the first upload even if all-zero
+
+    const wallShader = device.createShaderModule({ code: /* wgsl */`
+        struct U {
+            viewProj : mat4x4<f32>, view : mat4x4<f32>, proj : mat4x4<f32>,
+            camRight : vec3<f32>, halfSize : f32,
+            camUp    : vec3<f32>, _pad     : f32,
+            tanHalfFovY : f32, aspect : f32, zNear : f32, zFar : f32,
+            screenRes : vec2<f32>, _pad2 : vec2<f32>,   // RENDER_SCALE scene res (this pass's target)
+        };
+        struct Wall { boxMin : vec4<f32>, boxMax : vec4<f32> };   // boxMax.w = active (1/0)
+        @group(0) @binding(0) var<uniform> u        : U;
+        @group(0) @binding(1) var<uniform> walls    : array<Wall, ${MAX_WALLS}>;
+        @group(0) @binding(2) var          depthTex : texture_2d<f32>;   // filtBTex, fluid linear depth
+
+        struct VsOut {
+            @builtin(position) pos    : vec4<f32>,
+            @location(0)       normal : vec3<f32>,   // world-space face normal
+            @location(1)       dep    : f32,         // positive linear view-space depth
+        };
+
+        @vertex fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) iid: u32) -> VsOut {
+            var o: VsOut;
+            let w = walls[iid];
+            if (w.boxMax.w < 0.5) {
+                // Inactive wall: emit a clipped degenerate (z > w → outside NDC) so the
+                // whole instance is discarded without producing fragments.
+                o.pos = vec4<f32>(0.0, 0.0, 2.0, 1.0);
+                o.normal = vec3<f32>(0.0, 0.0, 1.0);
+                o.dep = 0.0;
+                return o;
+            }
+            // Unit-cube corners; the 36-index list below picks CCW-from-outside faces.
+            var corners = array<vec3<f32>,8>(
+                vec3<f32>(0,0,0), vec3<f32>(1,0,0), vec3<f32>(1,1,0), vec3<f32>(0,1,0),
+                vec3<f32>(0,0,1), vec3<f32>(1,0,1), vec3<f32>(1,1,1), vec3<f32>(0,1,1)
+            );
+            var idx = array<u32,36>(
+                4u,5u,6u, 4u,6u,7u,   // +Z
+                1u,0u,3u, 1u,3u,2u,   // -Z
+                5u,1u,2u, 5u,2u,6u,   // +X
+                0u,4u,7u, 0u,7u,3u,   // -X
+                7u,6u,2u, 7u,2u,3u,   // +Y
+                0u,1u,5u, 0u,5u,4u    // -Y
+            );
+            var normals = array<vec3<f32>,6>(
+                vec3<f32>(0,0,1), vec3<f32>(0,0,-1),
+                vec3<f32>(1,0,0), vec3<f32>(-1,0,0),
+                vec3<f32>(0,1,0), vec3<f32>(0,-1,0)
+            );
+            let corner = corners[idx[vi]];
+            let world  = w.boxMin.xyz + corner * (w.boxMax.xyz - w.boxMin.xyz);
+            o.pos    = u.viewProj * vec4<f32>(world, 1.0);
+            o.normal = normals[vi / 6u];
+            o.dep    = -(u.view * vec4<f32>(world, 1.0)).z;   // positive linear view-space depth
+            return o;
+        }
+
+        // MRT: target0 = shaded wall color (into sceneColorTex), target1 = the wall's
+        // positive linear view-space depth (into wallLinDepthTex), so the later spray /
+        // foam-composite passes can occlude their fragments against wall faces. A wall
+        // fragment discarded for fluid occlusion writes NEITHER target, so wallLinDepthTex
+        // keeps its per-frame BG_DEPTH(-1) clear there = "no wall in front" (correct: the
+        // fluid, not the wall, is what covers that pixel).
+        struct FsOut {
+            @location(0) color : vec4<f32>,
+            @location(1) lin   : f32,   // positive linear view-space depth (spray/foam occlusion)
+        };
+        @fragment fn fs(in: VsOut) -> FsOut {
+            // Fluid occlusion: filtBTex is at FLUID_RES_SCALE, this pass renders at
+            // RENDER_SCALE — remap the fragment coord by the resolution ratio (same
+            // convention as the spray-occlusion / foam-clip FS). Discard the wall
+            // fragment when the (opaque) fluid surface is nearer than it.
+            let coord      = vec2<i32>(in.pos.xy * (${FLUID_RES_SCALE} / ${RENDER_SCALE}));
+            let fluidDepth = textureLoad(depthTex, coord, 0).r;   // background = -1.0
+            if (fluidDepth > 0.0 && fluidDepth < in.dep - 0.05) { discard; }
+
+            let n     = normalize(in.normal);
+            let ldir  = normalize(vec3<f32>(${WALL_LIGHT_DIR.join(", ")}));
+            let diff  = max(dot(n, ldir), 0.0);
+            let shade = ${WALL_AMBIENT} + (1.0 - ${WALL_AMBIENT}) * diff;
+            var o: FsOut;
+            o.color = vec4<f32>(vec3<f32>(${WALL_COLOR.join(", ")}) * shade, 1.0);
+            o.lin   = in.dep;
+            return o;
+        }
+    ` });
+
+    const wallPipeline = device.createRenderPipeline({
+        layout:    "auto",
+        vertex:   { module: wallShader, entryPoint: "vs" },
+        fragment: { module: wallShader, entryPoint: "fs", targets: [{ format }, { format: "r16float" }] },
+        primitive: { topology: "triangle-list", cullMode: "back", frontFace: "ccw" },
+        depthStencil: { format: "depth24plus", depthWriteEnabled: true, depthCompare: "less" },
+    });
+
     // ── Textures + bind groups (rebuilt on resize) ────────────────────────
     let tw = 0, th = 0;
     let hwDepthTex, rawTex, filtATex, filtBTex;
@@ -1161,6 +1302,9 @@ export async function initFluidRenderer(device, canvas, particlePosBuffer, parti
     let thickRawV, thickAV, thickBV;
     let foamThickRawTex, foamThickRawV;
     let sceneColorTex, sceneColorV;   // final composited scene at RENDER_SCALE (blit source)
+    let wallDepthTex, wallDepthV;     // Pass W's own depth buffer (RENDER_SCALE, wall-vs-wall ordering)
+    let wallLinDepthTex, wallLinDepthV;  // Pass W MRT target1: wall linear depth (RENDER_SCALE, spray/foam occlusion)
+    let wallBG;
     // Filter bind groups: each reads a (depth, thickness) texture pair for the MRT NRF
     let filterBG_raw, filterBG_filtA, filterBG_filtB;
     let thickSmoothBG_B, thickSmoothBG_A;   // post-NRF thickness blur: B→A (H), A→B (V)
@@ -1177,6 +1321,8 @@ export async function initFluidRenderer(device, canvas, particlePosBuffer, parti
         thickRawTex?.destroy(); thickATex?.destroy(); thickBTex?.destroy();
         foamThickRawTex?.destroy();
         sceneColorTex?.destroy();
+        wallDepthTex?.destroy();
+        wallLinDepthTex?.destroy();
 
         const ra = GPUTextureUsage.RENDER_ATTACHMENT;
         const tb = GPUTextureUsage.TEXTURE_BINDING;
@@ -1219,6 +1365,17 @@ export async function initFluidRenderer(device, canvas, particlePosBuffer, parti
         sceneColorTex = device.createTexture({ size: [sw, sh], format, usage: ra | tb });
         sceneColorV   = sceneColorTex.createView();
 
+        // Pass W depth buffer — same RENDER_SCALE res as sceneColorTex, cleared every
+        // frame. Only used for wall-vs-wall ordering (fluid occlusion is manual).
+        wallDepthTex = device.createTexture({ size: [sw, sh], format: "depth24plus", usage: ra });
+        wallDepthV   = wallDepthTex.createView();
+
+        // Pass W MRT target1: wall linear view-space depth (r16float, same RENDER_SCALE res
+        // as sceneColorTex), cleared to BG_DEPTH every frame. Read by the spray and foam
+        // composite passes to occlude their fragments behind nearer wall faces.
+        wallLinDepthTex = device.createTexture({ size: [sw, sh], format: "r16float", usage: ra | tb });
+        wallLinDepthV   = wallLinDepthTex.createView();
+
         // Each NRF filter BG reads a (depth, thickness) pair.
         const mkFBG = (depthView, thickView) => device.createBindGroup({
             layout: filterBGL,
@@ -1253,9 +1410,21 @@ export async function initFluidRenderer(device, canvas, particlePosBuffer, parti
                 entries: [
                     { binding: 0, resource: { buffer: particleUniBuf } },
                     { binding: 1, resource: filtBV },
+                    { binding: 2, resource: wallLinDepthV },   // wall depth (spray occlusion)
                 ],
             });
         }
+
+        // Wall pass: camera (particleUniBuf) + wall AABB data (wallUniBuf) + filtBV
+        // (fluid depth, for manual occlusion). filtBV is rebuilt on resize.
+        wallBG = device.createBindGroup({
+            layout: wallPipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: { buffer: particleUniBuf } },
+                { binding: 1, resource: { buffer: wallUniBuf } },
+                { binding: 2, resource: filtBV },
+            ],
+        });
 
         if (foamThickPipeline) {
             // Accumulate bind group depends on filtBV (rebuilt on resize).
@@ -1273,6 +1442,7 @@ export async function initFluidRenderer(device, canvas, particlePosBuffer, parti
                     { binding: 1, resource: foamThickRawV },
                     { binding: 2, resource: foamSampler },
                     { binding: 3, resource: filtBV },                    // fluid silhouette clip
+                    { binding: 4, resource: wallLinDepthV },             // wall depth (foam occlusion)
                 ],
             });
         }
@@ -1288,8 +1458,39 @@ export async function initFluidRenderer(device, canvas, particlePosBuffer, parti
         });
     }
 
+    // ── setWalls: pack fluid.walls into the reused wallUni buffer, upload on change ──
+    // Called by main.js once per frame with fluid.walls (MAX_WALLS-length array of
+    // { active, min:Float32Array(3), max:Float32Array(3) }, AABB in grid/world coords).
+    // Inactive slots still get their box written (so a wall toggled off then on keeps
+    // its extents), but active=0 makes the VS collapse the instance to a degenerate.
+    // Uploads to the GPU uniform only when the packed data differs from the last upload.
+    function setWalls(walls) {
+        for (let i = 0; i < MAX_WALLS; i++) {
+            const b = i * 8;
+            const w = walls && walls[i];
+            if (w) {
+                wallUni[b]     = w.min[0]; wallUni[b + 1] = w.min[1]; wallUni[b + 2] = w.min[2];
+                wallUni[b + 3] = 0;
+                wallUni[b + 4] = w.max[0]; wallUni[b + 5] = w.max[1]; wallUni[b + 6] = w.max[2];
+                wallUni[b + 7] = w.active ? 1 : 0;
+            } else {
+                for (let k = 0; k < 8; k++) wallUni[b + k] = 0;
+            }
+        }
+        // Dirty check against the last-uploaded snapshot (same pattern as paramsBuffer).
+        let dirty = !wallUniInit;
+        if (!dirty) {
+            for (let k = 0; k < wallUni.length; k++) { if (wallUni[k] !== wallCache[k]) { dirty = true; break; } }
+        }
+        if (dirty) {
+            wallCache.set(wallUni);
+            wallUniInit = true;
+            device.queue.writeBuffer(wallUniBuf, 0, wallUni);
+        }
+    }
+
     // ── Render ────────────────────────────────────────────────────────────
-    return function render(cmd, count, cv, view, proj, viewProj, tsQuery = null) {
+    const render = function render(cmd, count, cv, view, proj, viewProj, tsQuery = null) {
         const colorTex = context.getCurrentTexture();
         rebuildTextures(colorTex.width, colorTex.height);
 
@@ -1432,6 +1633,27 @@ export async function initFluidRenderer(device, canvas, particlePosBuffer, parti
             pass.setPipeline(shadePipeline); pass.setBindGroup(0, shadeBG); pass.draw(3); pass.end();
         }
 
+        // Pass W: movable wall AABB boxes, drawn as opaque geometry over the shaded
+        // fluid (load) with their own depth buffer (cleared here for wall-vs-wall
+        // ordering). Fluid occlusion is manual in the FS (discard behind the fluid
+        // surface). MRT target1 (wallLinDepthV) captures the wall's linear depth,
+        // cleared to BG_DEPTH so wall-free / fluid-covered pixels read as "no wall",
+        // and is consumed by the spray + foam-composite passes for wall occlusion.
+        // Gated with the shade stage (6): walls are part of the "solid scene".
+        if (RENDER_STAGE >= 6) {
+            const pass = cmd.beginRenderPass({
+                colorAttachments: [
+                    { view: sceneColorV,   loadOp: "load", storeOp: "store" },
+                    { view: wallLinDepthV, clearValue: { r: BG_DEPTH, g: 0, b: 0, a: 1 }, loadOp: "clear", storeOp: "store" },
+                ],
+                depthStencilAttachment: { view: wallDepthV, depthClearValue: 1.0, depthLoadOp: "clear", depthStoreOp: "store" },
+            });
+            pass.setPipeline(wallPipeline);
+            pass.setBindGroup(0, wallBG);
+            pass.draw(36, MAX_WALLS);   // 36 verts (12 tris) per wall, MAX_WALLS instances (inactive collapse in VS)
+            pass.end();
+        }
+
         // Diffuse particles: composited on top of the shaded fluid. Always draws
         // diffuse.maxCount instances — dead pool slots are NaN'd out in the vertex
         // shader (see diffuse-gpu.js for why the pool never shrinks the draw count).
@@ -1512,4 +1734,8 @@ export async function initFluidRenderer(device, canvas, particlePosBuffer, parti
             });
         }
     };
+
+    // Expose setWalls on the render function so main.js can call renderer.setWalls(fluid.walls).
+    render.setWalls = setWalls;
+    return render;
 }

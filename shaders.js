@@ -1,4 +1,4 @@
-import { WG_SIZE } from './config.js';
+import { WG_SIZE, MAX_WALLS } from './config.js';
 
 const WGSL_COMMON = /* wgsl */`
 // Cohesive (negative) EOS pressure floor, gated by density: fluid near rest
@@ -102,12 +102,54 @@ fn hard_clamp_axis(p: f32, v: f32, lo: f32, hi: f32) -> vec2<f32> {
     if (np > hi) { np = hi; nv = 0.0; }
     return vec2<f32>(np, nv);
 }
+
+// ── 動く壁 (AABB障害物) ────────────────────────────────────────────────
+// Movable AABB obstacles, coupled to the fluid via grid boundary conditions
+// (AABB IF-test in UPDATE_GRID + G2P). Layout kept in sync with fluid-gpu.js's
+// 192B uniform (MAX_WALLS × 48B) and the renderer's box pass (config.js MAX_WALLS
+// is the single source of truth for the count).
+// min_active.w = active flag: 0.0 = inactive (ignored everywhere), 1.0 = active.
+// "active" means w >= 0.5. vel is derived CPU-side each simFrame as
+// (new min − prev-frame min)/DT.
+struct Wall {
+    min_active : vec4<f32>,   // xyz = min corner,  w = active flag (0=off / 1=on)
+    max_pad    : vec4<f32>,   // xyz = max corner
+    vel_pad    : vec4<f32>,   // xyz = wall velocity (grid units / sim time)
+}
+struct WallParams { walls: array<Wall, ${MAX_WALLS}> }
+
+// AABB signed distance + outward normal, packed as vec4 (xyz = normal, w = sdf).
+// Outside (w > 0): normal points from the nearest box face toward the query point
+//   (= face normal in the face region, corner-diagonal past a corner).
+// Inside  (w < 0): normal is the SHALLOWEST-penetration face's outward normal, so
+//   pushing along it by -w escapes the box by the least distance.
+// Shared by UPDATE_GRID (velocity BC), G2P (position push-out) and DIFFUSE_ADVECT.
+fn wall_sdf_normal(p: vec3<f32>, mn: vec3<f32>, mx: vec3<f32>) -> vec4<f32> {
+    let dmin = mn - p;   // per-axis: >0 ⇒ p is below the min face
+    let dmax = p - mx;   // per-axis: >0 ⇒ p is above the max face
+    let q    = max(dmin, dmax);
+    let qmax = max(q.x, max(q.y, q.z));
+    if (qmax > 0.0) {
+        // Outside on at least one axis: distance/normal from the nearest surface point.
+        let nearest = clamp(p, mn, mx);
+        let diff    = p - nearest;
+        let len     = length(diff);
+        let n = select(vec3<f32>(0.0, 1.0, 0.0), diff / len, len > 1e-6);
+        return vec4<f32>(n, length(max(q, vec3<f32>(0.0))));
+    }
+    // Fully inside: qmax (the least-negative axis gap) is the shallowest penetration.
+    var n = vec3<f32>(0.0, 1.0, 0.0);
+    if (qmax == q.x)      { n = vec3<f32>(select(-1.0, 1.0, dmax.x > dmin.x), 0.0, 0.0); }
+    else if (qmax == q.y) { n = vec3<f32>(0.0, select(-1.0, 1.0, dmax.y > dmin.y), 0.0); }
+    else                  { n = vec3<f32>(0.0, 0.0, select(-1.0, 1.0, dmax.z > dmin.z)); }
+    return vec4<f32>(n, qmax);   // qmax <= 0 = signed penetration depth
+}
 `;
 
 export const WGSL_CLEAR = WGSL_COMMON + /* wgsl */`
-@group(0) @binding(0) var<storage, read_write> cell_mv   : array<atomic<i32>>;
-@group(0) @binding(1) var<storage, read_write> cell_mass : array<atomic<i32>>;
-@group(0) @binding(2) var<uniform>             params    : Params;
+@group(0) @binding(0) var<storage, read_write> cell_mv        : array<atomic<i32>>;
+@group(0) @binding(1) var<storage, read_write> cell_mass      : array<atomic<i32>>;
+@group(0) @binding(2) var<uniform>             params         : Params;
 
 @compute @workgroup_size(${WG_SIZE})
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -344,10 +386,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }`;
 
 export const WGSL_UPDATE_GRID = WGSL_COMMON + /* wgsl */`
-@group(0) @binding(0) var<storage, read_write> cell_mv     : array<atomic<i32>>;
-@group(0) @binding(1) var<storage, read_write> cell_mass   : array<atomic<i32>>;
-@group(0) @binding(2) var<uniform>             params      : Params;
-@group(0) @binding(3) var<storage, read_write> cell_mv_f32 : array<f32>;
+@group(0) @binding(0) var<storage, read_write> cell_mv        : array<atomic<i32>>;
+@group(0) @binding(1) var<storage, read_write> cell_mass      : array<atomic<i32>>;
+@group(0) @binding(2) var<uniform>             params         : Params;
+@group(0) @binding(3) var<storage, read_write> cell_mv_f32    : array<f32>;
+@group(0) @binding(4) var<uniform>             wallp          : WallParams;
 
 @compute @workgroup_size(${WG_SIZE})
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -384,6 +427,32 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // 床(y_min)際のセルはXZ方向速度に摩擦減衰をかけ、床に沿って粒子が滑って
     // 角に集まるのを抑える。
     if (cy < 2) { vx *= 0.85; vz *= 0.9; }
+
+    // 動く壁 (AABB障害物) の速度境界条件。外壁Splash処理・床摩擦の後に適用。
+    // セル中心 (index+0.5、APPLY_HAND と同じ規約) で壁SDFを評価:
+    //  - 壁内部 (sdf<0): v = wall_vel を強制。壁が動くとこれが流体を押す駆動力になる。
+    //  - 表面1セル以内: 相対速度 vrel=v-wall_vel の法線成分が壁に「接近する」向き(<0)の
+    //    ときのみその成分を除去 (外壁と同じ方向限定ロジック=押し返しは生かす。
+    //    接線成分は保持するので壁面を滑る)。
+    //    帯幅は2セル→1セルに縮小済み (2セルだと隙間を閉じる微小な接近速度まで毎ステップ
+    //    殺され、壁際の隙間が上ほど広い不均一として定着する — ヘッドレス計測で確認。
+    //    1セルなら全高で隙間~0に密着し、貫通・漏出もゼロ)。
+    let cellPos = vec3<f32>(f32(cx) + 0.5, f32(cy) + 0.5, f32(cz) + 0.5);
+    var wv = vec3<f32>(vx, vy, vz);
+    for (var wi = 0u; wi < ${MAX_WALLS}u; wi++) {
+        let wall = wallp.walls[wi];
+        if (wall.min_active.w < 0.5) { continue; }   // 非activeはスキップ
+        let wvel = wall.vel_pad.xyz;
+        let sn   = wall_sdf_normal(cellPos, wall.min_active.xyz, wall.max_pad.xyz);
+        if (sn.w < 0.0) {
+            wv = wvel;
+        } else if (sn.w < 1.0) {
+            let vrel = wv - wvel;
+            let vn   = dot(vrel, sn.xyz);
+            if (vn < 0.0) { wv = wv - vn * sn.xyz; }
+        }
+    }
+    vx = wv.x; vy = wv.y; vz = wv.z;
 
     cell_mv_f32[idx*3u+0u] = vx;
     cell_mv_f32[idx*3u+1u] = vy;
@@ -462,6 +531,7 @@ export const WGSL_G2P = WGSL_COMMON + /* wgsl */`
 @group(0) @binding(3) var<storage, read>       cell_mv_f32     : array<f32>;
 @group(0) @binding(4) var<uniform>             params          : Params;
 @group(0) @binding(5) var<storage, read>       weights         : array<BaseWeights>;
+@group(0) @binding(6) var<uniform>             wallp           : WallParams;
 
 @compute @workgroup_size(${WG_SIZE})
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -524,6 +594,42 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let distBelowFloor = floorZoneY - xn.y;
         let blend = clamp(distBelowFloor / zoneHeight, 0.0, 1.0);
         nv.y += params.wall_stiffness * blend * distBelowFloor;
+    }
+
+    // 動く壁 (AABB) の押し出し。床バネと同じ場所 (ハードクランプの前) で生のnp/nvを使う。
+    for (var wi = 0u; wi < ${MAX_WALLS}u; wi++) {
+        let wall = wallp.walls[wi];
+        if (wall.min_active.w < 0.5) { continue; }   // 非activeのみスキップ
+        let wmin = wall.min_active.xyz;
+        let wmax = wall.max_pad.xyz;
+        let wvel = wall.vel_pad.xyz;
+
+        // バネ補正: lookahead予測位置が「壁に食い込む」(sdf<0) ときだけ法線方向へ減速材として
+        // 効かせる。以前は近接ゾーン(wall_min=3セル)で常時押し出していたが、それだと壁際に
+        // 「バネ vs 水圧」の釣り合いで決まる隙間ができ、静水圧が最大の床付近だけ隙間が潰れて
+        // 不自然に狭く見える (上ほど広い=不均一)。外壁・床と同じく定常時の安定化は
+        // UPDATE_GRID のIF速度帯に任せ、粒子は壁面に密着させる (全高で隙間ゼロ=均一)。
+        // lookahead があるので、動く壁へ突っ込む粒子は実接触の前に減速される。
+        let xnw = np + nv * params.dt * params.lookahead_k;
+        let sxn = wall_sdf_normal(xnw, wmin, wmax);
+        if (sxn.w < 0.0) {
+            let dist  = -sxn.w;
+            let blend = clamp(dist / params.wall_min, 0.0, 1.0);
+            nv += sxn.xyz * (params.wall_stiffness * blend * dist);
+        }
+
+        // 安全弁: 更新後位置がなお壁内部なら最近傍表面へ投影し、壁との相対速度の
+        // 法線成分 (壁に向かう向き=負のみ) をゼロ化。sn.w<0 なので np - n*sn.w が外向き押し出し。
+        // 投影量は1ステップ0.5セルまでに制限する。深く埋まった粒子を一気に表面へテレポート
+        // すると界面に密度スパイクが立ち、EOS圧力が粒子を吹き上げる自励噴出ループになる。
+        // 0.5セル/ステップの漸進排出なら圧力場が追従できる (深く埋まった粒子のテレポートによる
+        // 密度スパイク噴出を防ぐ汎用の安定化)。
+        let snp = wall_sdf_normal(np, wmin, wmax);
+        if (snp.w < 0.0) {
+            np = np - snp.xyz * max(snp.w, -0.5);
+            let vn = dot(nv - wvel, snp.xyz);
+            if (vn < 0.0) { nv -= vn * snp.xyz; }
+        }
     }
 
     // ハードクランプは最後に安全弁として適用 (バネで押し戻された後もなお壁を超える場合のみ発動)
@@ -716,6 +822,7 @@ struct AdvectParams {
 @group(0) @binding(3) var<storage, read>       cell_mv_f32       : array<f32>;
 @group(0) @binding(4) var<storage, read_write> free_list         : array<u32>;
 @group(0) @binding(5) var<storage, read_write> free_list_top     : atomic<i32>;
+@group(0) @binding(6) var<uniform>             wallp             : WallParams;
 
 // Same trilinear quadratic-B-spline sample as G2P, against the main fluid's
 // already gravity-and-boundary-applied grid velocity (cell_mv_f32).
@@ -787,6 +894,25 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         p.vel.y += params.dt * (adv.buoyancy * -params.gravity + adv.drag * (gv.y - p.vel.y));
         p.vel.z += params.dt * adv.drag * (gv.z - p.vel.z);
         p.pos = vec4<f32>(pos3 + params.dt * p.vel.xyz, 0.0);
+    }
+
+    // 動く壁 (AABB) に入った diffuse 粒子を最も浅い貫通軸で押し出し、その軸(=法線)方向の
+    // 速度成分を減衰反射 (外壁の reflect_axis と同じ DIFFUSE_RESTITUTION、壁速度基準)。
+    // 全active壁 (w >= 0.5) に適用。diffuse は装飾トレーサーで壁を突き抜けると見栄えが悪い。
+    for (var wi = 0u; wi < ${MAX_WALLS}u; wi++) {
+        let wall = wallp.walls[wi];
+        if (wall.min_active.w < 0.5) { continue; }
+        let sn = wall_sdf_normal(p.pos.xyz, wall.min_active.xyz, wall.max_pad.xyz);
+        if (sn.w < 0.0) {
+            p.pos = vec4<f32>(p.pos.xyz - sn.xyz * sn.w, 0.0);   // 最近傍表面へ押し出し
+            let wvel = wall.vel_pad.xyz;
+            let vrel = p.vel.xyz - wvel;
+            let vn   = dot(vrel, sn.xyz);
+            if (vn < 0.0) {
+                let newvrel = vrel - (1.0 + DIFFUSE_RESTITUTION) * vn * sn.xyz;
+                p.vel = vec4<f32>(wvel + newvrel, 0.0);
+            }
+        }
     }
 
     // Boundary: same [hard_min, hard_max] box as the main fluid's hard clamp.

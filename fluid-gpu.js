@@ -1,4 +1,4 @@
-import { WG_SIZE } from './config.js';
+import { WG_SIZE, MAX_WALLS } from './config.js';
 import {
     WGSL_CLEAR, WGSL_COMPUTE_WEIGHTS, WGSL_P2G_MASS, WGSL_P2G_MOM,
     WGSL_DECODE_MASS, WGSL_APPLY_HAND, WGSL_UPDATE_GRID, WGSL_G2P,
@@ -45,6 +45,39 @@ export class FluidGPU {
         // simFrame() dispatches its generate+advect dispatches (into the same shared
         // compute pass) once per substep, right after G2P — see diffuse-gpu.js.
         this.diffuse = null;
+
+        // 動く壁 (AABB障害物)。グリッドBC方式 (UPDATE_GRID/G2P のAABB IF判定) で流体と結合する。
+        // 呼び出し側 (main.js) は setWall(i, min, max) で位置を動かすだけ。壁速度は simFrame()
+        // 冒頭で (今回min − 前回simFrame時min)/DT として内部導出し uniform に書く
+        // (=次の setWall まで vel=0)。レンダラーが毎フレーム this.walls を読んでボックスを描く。
+        // min/max はグリッド座標。uniform には active なら 1、非active なら 0 を書く (Wall.min_active.w)。
+        this.walls = [];
+        this._wallPrevMin = [];   // 各壁の前回simFrame時のmin (速度導出用)
+        for (let i = 0; i < MAX_WALLS; i++) {
+            this.walls.push({ active: false, min: new Float32Array(3), max: new Float32Array(3) });
+            this._wallPrevMin.push(new Float32Array(3));
+        }
+    }
+
+    // 壁iをactive化しAABBを設定 (min/max は長さ3の配列様)。位置を動かすだけでよく、
+    // 壁速度は simFrame() が今回minと前回minの差から導出する。
+    setWall(i, min, max) {
+        const w = this.walls[i];
+        // 非active→activeの遷移では前回minを新しい位置に同期する。さもないと次のsimFrameで
+        // vel=(新min−旧位置)/DT の巨大な見かけ速度が1フレーム分流体に注入され、出現しただけで
+        // 流体が吹き飛ぶ (壁の「出現」は移動ではないので速度0が正しい)。
+        if (!w.active) {
+            const prev = this._wallPrevMin[i];
+            prev[0] = min[0]; prev[1] = min[1]; prev[2] = min[2];
+        }
+        w.active = true;
+        w.min[0] = min[0]; w.min[1] = min[1]; w.min[2] = min[2];
+        w.max[0] = max[0]; w.max[1] = max[1]; w.max[2] = max[2];
+    }
+
+    // 壁iを非active化 (シェーダ側は min_active.w=0 で無視)。
+    removeWall(i) {
+        this.walls[i].active = false;
     }
 
     // x0..z1: normalized 0–1 per axis. Particles placed every 0.5 grid cells.
@@ -166,6 +199,9 @@ export class FluidGPU {
         // 80 bytes: the original 12 fields (48B) + bbox_min/bbox_max (6×i32) + 2×pad
         // (32B) — see updateHand()/WGSL_APPLY_HAND for why the bbox exists.
         this.handParamsBuffer     = d.createBuffer({ size: 80,        usage: UN | CD });
+        // 動く壁 uniform: MAX_WALLS × 48B (Wall = min_active/max_pad/vel_pad の 3×vec4)。
+        // WebGPUは createBuffer をゼロ初期化するので、初期状態(全wall非active)はそのまま有効。
+        this.wallParamsBuffer     = d.createBuffer({ size: MAX_WALLS * 48, usage: UN | CD });
 
         // Delete (stream-compaction) scratch buffers — see spawnParticles()/deleteNear().
         // Affine is intentionally not double-buffered here (see WGSL_COMPACT comment).
@@ -200,6 +236,12 @@ export class FluidGPU {
         this._rayF32 = new Float32Array(this._rayBuf);
         this._rayPending = false;
         this.lastRayHit = null;
+
+        // 壁 uniform の再利用CPUバッファ (12 f32/wall: min.xyz+active, max.xyz+pad, vel.xyz+pad)。
+        // _wallPrevF32 は NaN 埋めで初回 _writeWallParams() を必ずアップロードさせる (paramsBufferのdedupパターンとNaN≠NaNを併用)。
+        this._wallBuf     = new ArrayBuffer(MAX_WALLS * 48);
+        this._wallF32     = new Float32Array(this._wallBuf);
+        this._wallPrevF32 = new Float32Array(MAX_WALLS * 12).fill(NaN);
 
         // Reused scratch arrays for spawnParticles() — sized to the full particle
         // capacity so any valid n never needs a fallback allocation. Mass is always
@@ -260,6 +302,68 @@ export class FluidGPU {
         this.device.queue.writeBuffer(this.paramsBuffer, 0, this._paramsBuf);
     }
 
+    // 壁 uniform を書く。各壁の速度を (今回min − 前回simFrame時min)/DT で導出してから
+    // 今回minを _wallPrevMin に確定 (setWallが呼ばれず位置が動かなければ差=0 → vel=0)。
+    // paramsBuffer と同じく内容が前回と同一ならGPUアップロードをスキップ (壁が静止すれば
+    // vel=0 で安定し書き込みが止まる)。simFrame() 冒頭で1回だけ呼ぶ。
+    _writeWallParams() {
+        const invDt = 1.0 / this.DT;
+        // sim判定用AABBの「実効値」延長のしきい値。面が外周境界帯 (HARD_MIN+1 / HARD_MAX-1)
+        // を越えていれば、その面をグリッド外 (下側 -4 / 上側 境界+4) まで延ばす。
+        const HM1 = this.HARD_MIN + 1.0;
+        for (let i = 0; i < MAX_WALLS; i++) {
+            const w = this.walls[i];
+            const prev = this._wallPrevMin[i];
+            const base = i * 12;
+            // 壁速度は必ず「実寸の min」で導出する。実効AABBへのスナップで見かけ速度が
+            // 発生してはならないため (延長は sim判定のためだけの変換で、実移動ではない)。
+            let vx = 0, vy = 0, vz = 0;
+            if (w.active) {
+                vx = (w.min[0] - prev[0]) * invDt;
+                vy = (w.min[1] - prev[1]) * invDt;
+                vz = (w.min[2] - prev[2]) * invDt;
+            }
+            prev[0] = w.min[0]; prev[1] = w.min[1]; prev[2] = w.min[2];
+
+            // sim判定用の実効AABB。外周境界帯に接している面はグリッド外まで延長する
+            // (床のymin IF帯と同じ思想)。理由: 壁のAABB底面が HARD_MIN (床の水が静止する
+            // 高さ) と同一平面にあると、床の水層の粒子に対して壁SDFの最近傍面が「底面」に
+            // なり法線が下向きになる → 横に押すべき粒子を床へ押し付け、壁の根元に水が
+            // 潜り込む/張り付く。面を境界外へ延ばすとその面が流体領域から消え、法線は
+            // 側面のみになる。this.walls の実寸は変えない (レンダラーが実寸を描くため)。
+            let emnx = w.min[0], emny = w.min[1], emnz = w.min[2];
+            let emxx = w.max[0], emxy = w.max[1], emxz = w.max[2];
+            if (w.min[0] <= HM1) { emnx = -4.0; }
+            if (w.min[1] <= HM1) { emny = -4.0; }
+            if (w.min[2] <= HM1) { emnz = -4.0; }
+            if (w.max[0] >= this.HARD_MAX_X - 1.0) { emxx = this.grid_X_num + 4.0; }
+            if (w.max[1] >= this.HARD_MAX_Y - 1.0) { emxy = this.grid_Y_num + 4.0; }
+            if (w.max[2] >= this.HARD_MAX_Z - 1.0) { emxz = this.grid_Z_num + 4.0; }
+
+            this._wallF32[base + 0] = emnx;
+            this._wallF32[base + 1] = emny;
+            this._wallF32[base + 2] = emnz;
+            // min_active.w = active フラグ: active なら 1、非activeなら 0。
+            this._wallF32[base + 3] = w.active ? 1.0 : 0.0;
+            this._wallF32[base + 4] = emxx;
+            this._wallF32[base + 5] = emxy;
+            this._wallF32[base + 6] = emxz;
+            this._wallF32[base + 7] = 0.0;
+            this._wallF32[base + 8]  = vx;
+            this._wallF32[base + 9]  = vy;
+            this._wallF32[base + 10] = vz;
+            this._wallF32[base + 11] = 0.0;
+        }
+
+        let same = true;
+        for (let i = 0; i < MAX_WALLS * 12; i++) {
+            if (this._wallF32[i] !== this._wallPrevF32[i]) { same = false; break; }
+        }
+        if (same) return;
+        this._wallPrevF32.set(this._wallF32);
+        this.device.queue.writeBuffer(this.wallParamsBuffer, 0, this._wallBuf);
+    }
+
     _createPipelines() {
         const d = this.device;
         const mkP = (code) => d.createComputePipeline({
@@ -302,12 +406,13 @@ export class FluidGPU {
         ]);
         this._updateGridBG = mkBG(this._updateGridPipeline, [
             buf(0, this.cellMvBuffer), buf(1, this.cellMassBuffer), buf(2, this.paramsBuffer),
-            buf(3, this.cellMvF32Buffer),
+            buf(3, this.cellMvF32Buffer), buf(4, this.wallParamsBuffer),
         ]);
         this._g2pBG = mkBG(this._g2pPipeline, [
             buf(0, this.particlePosBuffer),    buf(1, this.particleVelBuffer),
             buf(2, this.particleAffineBuffer), buf(3, this.cellMvF32Buffer),
             buf(4, this.paramsBuffer),         buf(5, this.particleWeightsBuffer),
+            buf(6, this.wallParamsBuffer),
         ]);
         this._applyHandBG = mkBG(this._applyHandPipeline, [
             buf(0, this.cellMvF32Buffer), buf(1, this.paramsBuffer), buf(2, this.handParamsBuffer),
@@ -497,6 +602,7 @@ export class FluidGPU {
         const wgP = Math.ceil(this.active_particle_num / WG_SIZE);
         const wgG = Math.ceil(this.grid_num / WG_SIZE);
         this._writeParamsBuffer(sub_dt);
+        this._writeWallParams();
 
         const pass = cmd.beginComputePass();
         // `wg` is either a workgroup count (1D) or a [x,y,z] array (3D, used by

@@ -129,6 +129,7 @@ export class DiffuseGPU {
                 buf(3, f.cellMvF32Buffer),
                 buf(4, this.freeListBuffer),
                 buf(5, this.freeListTopBuffer),
+                buf(6, f.wallParamsBuffer),   // 動く壁 (AABB障害物)。fluid が初期化済みの前提
             ],
         });
     }

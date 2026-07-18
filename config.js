@@ -6,6 +6,10 @@ export const dpr = isMobile ? 1 : Math.min(window.devicePixelRatio || 1, 2);
 // sized ~2-3x the expected simultaneous live count (see ref/diffuse-particles-gpu-migration.md §7-3).
 export const DIFFUSE_MAX_COUNT = isMobile ? 12000 : 30000;
 
+// Movable wall obstacles (AABB) — shared by shaders.js (WGSL template literals),
+// fluid-gpu.js (uniform buffer sizing) and fluid-renderer.js (box render pass).
+export const MAX_WALLS = 4;
+
 // ─────────────────────────────────────────────────────────────
 //  Diagnostic URL overrides (e.g. ?p=20000&frs=0.25) — lets low-end/mobile
 //  devices be load-tested (device-lost / TDR triage) without a code push.

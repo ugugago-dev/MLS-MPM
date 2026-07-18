@@ -590,13 +590,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     //    ~1.4セル浮き、深い水柱の底は y≈2 まで沈む → 壁を挟んで左右の底面高さがズレて見えた
     //  - 食い込み時のみ (一時試行): 底面は均一になるがクッションを失い、全粒子が y=2.0 の同一
     //    平面にパンケーキ化→底セルの密度スパイクをEOSが弾き、薄い層で縦振動 (vyMax 3.4倍)
-    //  - 1セル (現行): 層の自重だけで釣り合いが潰れて底面は水深によらず y≈2 で均一、かつ
-    //    クッション維持で薄層のスパイクは旧3セルと同水準。3セルに戻さないこと
-    let floorZoneY = params.hard_min + 1.0;
+    //  - 1セル: ヘッドレス指標は良好だったが実機で薄層の振動が残った (ユーザー確認)
+    //  - 2セル (現行): 実機の目視判断で採用。~2セル厚以上の層なら自重で釣り合いが潰れ切り
+    //    底面は水深によらず y≈2 で均一 (ヘッドレス確認済み)。1セル未満の極薄シートはやや
+    //    浮きうるが許容。3セルに戻さないこと
+    let floorZoneY = params.hard_min + 2.0;
     let xn = np + nv * params.dt * params.lookahead_k;
     if (xn.y < floorZoneY) {
         let distBelowFloor = floorZoneY - xn.y;
-        let blend = clamp(distBelowFloor / 1.0, 0.0, 1.0);
+        let blend = clamp(distBelowFloor / 2.0, 0.0, 1.0);
         nv.y += params.wall_stiffness * blend * distBelowFloor;
     }
 

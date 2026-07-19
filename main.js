@@ -63,47 +63,92 @@ const handState = {
 };
 
 // ─────────────────────────────────────────────────────────────
-//  Movable wall (wall 0 only — W toggles it, Shift+L-drag moves it)
+//  Movable walls (W adds one, Shift+W removes; Shift+L-drag moves, Z/X/C/V rotates)
 // ─────────────────────────────────────────────────────────────
 // setWall()/removeWall() write straight to a GPU buffer (no command encoder involved,
 // same pattern as fluid.updateHand() below), so they're safe to call directly from
 // input handlers rather than deferring to the sim loop. Guard on fluid.device so a
 // stray keypress/drag before init() finishes (GPU not ready yet, fluid.walls may not
 // even be populated) is a no-op instead of a crash.
-const wall0Min = new Float32Array(3), wall0Max = new Float32Array(3);
-function toggleWall0() {
+//
+// "Selected" wall = the target of Shift+drag and the Z/X/C/V rotation keys. Adding a
+// wall selects it; Shift+drag re-selects whichever wall the pointer ray hits first.
+let selectedWall = 0;
+// Per-slot spawn Z offset (fraction of grid_Z) so consecutively added walls don't
+// stack on top of each other before the user drags them apart.
+const WALL_SLOT_ZOFF = [0, -0.22, 0.22, -0.11];
+const _wallAddMin = new Float32Array(3), _wallAddMax = new Float32Array(3);
+function addWall() {
     if (!fluid.device) return;
-    if (fluid.walls[0].active) {
-        fluid.removeWall(0);
-        return;
+    let slot = -1;
+    for (let i = 0; i < fluid.walls.length; i++) if (!fluid.walls[i].active) { slot = i; break; }
+    if (slot < 0) return;   // all MAX_WALLS in use
+    // Slab perpendicular to Z, ~85% of the original full-span wall: ~76% of the tank
+    // width, floor to 72% height, 3 cells thick. Z-perpendicular because the default
+    // camera (theta=π/2) looks down the X axis: screen-horizontal = Z, so Shift+drag
+    // sweeps it sideways.
+    const cxc = fluid.grid_X_num / 2;
+    const czc = fluid.grid_Z_num / 2 + fluid.grid_Z_num * WALL_SLOT_ZOFF[slot % WALL_SLOT_ZOFF.length];
+    _wallAddMin[0] = cxc - fluid.grid_X_num * 0.38;  _wallAddMax[0] = cxc + fluid.grid_X_num * 0.38;
+    _wallAddMin[1] = fluid.HARD_MIN;                 _wallAddMax[1] = fluid.grid_Y_num * 0.72;
+    _wallAddMin[2] = czc - 1.5;                      _wallAddMax[2] = czc + 1.5;
+    fluid.setWall(slot, _wallAddMin, _wallAddMax);
+    selectedWall = slot;
+}
+function removeSelectedWall() {
+    if (!fluid.device) return;
+    if (fluid.walls[selectedWall]?.active) fluid.removeWall(selectedWall);
+    else for (let i = fluid.walls.length - 1; i >= 0; i--) {
+        if (fluid.walls[i].active) { fluid.removeWall(i); break; }
     }
-    // Initial shape: a slab perpendicular to Z, 3 cells thick, straddling the grid
-    // center; spans the full X depth and most of the height (floor margin to 85%).
-    // Z-perpendicular because the default camera (theta=π/2) looks down the X axis:
-    // screen-horizontal = Z, so Shift+drag sweeps the wall sideways through the tank
-    // (an X-perpendicular slab would face the camera full-frame and its only visible
-    // travel direction, Z, is already spanned — the clamp would pin it in place).
-    const czc = fluid.grid_Z_num / 2;
-    wall0Min[0] = fluid.HARD_MIN;   wall0Max[0] = fluid.HARD_MAX_X;
-    wall0Min[1] = fluid.HARD_MIN;   wall0Max[1] = fluid.grid_Y_num * 0.85;
-    wall0Min[2] = czc - 1.5;        wall0Max[2] = czc + 1.5;
-    fluid.setWall(0, wall0Min, wall0Max);
+    for (let i = fluid.walls.length - 1; i >= 0; i--) {
+        if (fluid.walls[i].active) { selectedWall = i; break; }
+    }
 }
 
-// Drag state for moving wall 0: the plane is fixed at drag start (view-direction normal
-// through the wall's center at that moment), and every subsequent pointer move
-// re-intersects the pointer ray with that same plane to get a world-space delta —
-// added to the wall's start AABB (position only; size never changes during a drag).
-// All scratch arrays below are pre-allocated and reused every pointerdown/move, per the
-// project's no-per-frame/per-event-allocation convention (see computeCameraFrame above).
+// Pick the active wall the pointer ray hits first (ray transformed into each wall's
+// yaw+pitch local frame, then the shared slab test) — or -1 if it misses them all.
+const _pickO = new Float32Array(3), _pickD = new Float32Array(3);
+const _pickLo = new Float32Array(3), _pickHi = new Float32Array(3);
+function pickWall(eye, dir) {
+    let best = -1, bestT = Infinity;
+    for (let i = 0; i < fluid.walls.length; i++) {
+        const w = fluid.walls[i];
+        if (!w.active) continue;
+        const cx = (w.min[0] + w.max[0]) * 0.5, cy = (w.min[1] + w.max[1]) * 0.5, cz = (w.min[2] + w.max[2]) * 0.5;
+        const cyw = Math.cos(w.theta), syw = Math.sin(w.theta);
+        const cp  = Math.cos(w.phi),   sp  = Math.sin(w.phi);
+        // Rᵀ = R_x(-φ)·R_y(-θ), same convention as shaders.js wall_to_local.
+        let dx = eye[0] - cx, dy = eye[1] - cy, dz = eye[2] - cz;
+        let x1 = cyw * dx - syw * dz, z1 = syw * dx + cyw * dz;
+        _pickO[0] = x1; _pickO[1] = cp * dy + sp * z1; _pickO[2] = -sp * dy + cp * z1;
+        dx = dir[0]; dy = dir[1]; dz = dir[2];
+        x1 = cyw * dx - syw * dz; z1 = syw * dx + cyw * dz;
+        _pickD[0] = x1; _pickD[1] = cp * dy + sp * z1; _pickD[2] = -sp * dy + cp * z1;
+        _pickLo[0] = -(w.max[0] - w.min[0]) * 0.5; _pickHi[0] = -_pickLo[0];
+        _pickLo[1] = -(w.max[1] - w.min[1]) * 0.5; _pickHi[1] = -_pickLo[1];
+        _pickLo[2] = -(w.max[2] - w.min[2]) * 0.5; _pickHi[2] = -_pickLo[2];
+        const t = rayBoxIntersect(_pickO, _pickD, _pickLo, _pickHi);
+        if (t !== null && t < bestT) { bestT = t; best = i; }
+    }
+    return best;
+}
+
+// Drag state for moving the selected wall: the plane is fixed at drag start
+// (view-direction normal through the wall's center at that moment), and every
+// subsequent pointer move re-intersects the pointer ray with that same plane to get
+// a world-space delta — added to the wall's start AABB (position only; size never
+// changes during a drag). All scratch arrays below are pre-allocated and reused
+// every pointerdown/move, per the project's no-per-event-allocation convention.
 const wallDrag = {
-    active: false, pointerId: null,
+    active: false, pointerId: null, wallIndex: 0,
     forward: new Float32Array(3), planePoint: new Float32Array(3),
     startHit: new Float32Array(3), startMin: new Float32Array(3), startMax: new Float32Array(3),
 };
 const _wallRayDir = new Float32Array(3);
 const _wallHit    = new Float32Array(3);
 const _wallNewMin = new Float32Array(3), _wallNewMax = new Float32Array(3);
+const _wallRotHalf = new Float32Array(3);  // rotated-box world-AABB half extents (drag clamp)
 const _wallHardMax = new Float32Array(3); // [HARD_MAX_X, HARD_MAX_Y, HARD_MAX_Z], filled once below
 _wallHardMax[0] = fluid.HARD_MAX_X; _wallHardMax[1] = fluid.HARD_MAX_Y; _wallHardMax[2] = fluid.HARD_MAX_Z;
 
@@ -141,18 +186,34 @@ let lastPointerX = window.innerWidth / 2, lastPointerY = window.innerHeight / 2;
 // gap (keydown alone can't do this because held-key repeats are suppressed below,
 // so a key blocked at press time would never get another chance to activate).
 let eKeyDown = false, rKeyDown = false;
+// Z/X (yaw) and C/V (pitch): rotate the selected wall while held — applied per-frame
+// in the main loop (like E/R) so the turn rate is frame-rate independent and the sim
+// derives a proper angular velocity vector from the per-frame angle deltas.
+let zKeyDown = false, xKeyDown = false, cKeyDown = false, vKeyDown = false;
+const WALL_ROT_SPEED = 2.5;   // rad/s (real time) while a rotation key is held
 window.addEventListener("keydown", (e) => {
     if (e.repeat) return;
     if (e.key === "e" || e.key === "E") eKeyDown = true;
     if (e.key === "r" || e.key === "R") rKeyDown = true;
-    if (e.key === "w" || e.key === "W") toggleWall0();
+    if (e.key === "w" || e.key === "W") { if (e.shiftKey) removeSelectedWall(); else addWall(); }
+    if (e.key === "z" || e.key === "Z") zKeyDown = true;
+    if (e.key === "x" || e.key === "X") xKeyDown = true;
+    if (e.key === "c" || e.key === "C") cKeyDown = true;
+    if (e.key === "v" || e.key === "V") vKeyDown = true;
 });
 window.addEventListener("keyup", (e) => {
     if (e.key === "e" || e.key === "E") eKeyDown = false;
     if (e.key === "r" || e.key === "R") rKeyDown = false;
+    if (e.key === "z" || e.key === "Z") zKeyDown = false;
+    if (e.key === "x" || e.key === "X") xKeyDown = false;
+    if (e.key === "c" || e.key === "C") cKeyDown = false;
+    if (e.key === "v" || e.key === "V") vKeyDown = false;
 });
-// Dragging elsewhere (e.g. orbit) can eat the keyup; drop both modes on blur too.
-window.addEventListener("blur", () => { eKeyDown = false; rKeyDown = false; });
+// Dragging elsewhere (e.g. orbit) can eat the keyup; drop held modes on blur too.
+window.addEventListener("blur", () => {
+    eKeyDown = false; rKeyDown = false;
+    zKeyDown = false; xKeyDown = false; cKeyDown = false; vKeyDown = false;
+});
 
 // ─────────────────────────────────────────────────────────────
 //  Pointer events
@@ -171,20 +232,29 @@ window.addEventListener("blur", () => { eKeyDown = false; rKeyDown = false; });
         const aspect  = c.width / c.height;
         const { cv, viewProj: vp } = computeCameraFrame(aspect);
 
-        // Shift+left-drag moves wall 0 when it's active — checked first so this branch
+        // Shift+left-drag moves a wall when any is active — checked first so this branch
         // preempts both the push (iact) and orbit handling below; falls through to the
-        // normal push if the wall isn't active (per spec: no active wall = normal drag).
-        if (e.button === 0 && e.shiftKey && fluid.walls[0].active) {
+        // normal push if no wall is active (per spec: no active wall = normal drag).
+        // The pointer ray picks the wall it hits (which also re-selects it for Z/X/C/V);
+        // if it misses every wall, the currently selected one is dragged as before.
+        if (e.button === 0 && e.shiftKey && fluid.device && fluid.walls.some(w => w.active)) {
             const fx = camera.target[0] - cv.eye[0], fy = camera.target[1] - cv.eye[1], fz = camera.target[2] - cv.eye[2];
             const fl = Math.hypot(fx, fy, fz) || 1;
             wallDrag.forward[0] = fx / fl; wallDrag.forward[1] = fy / fl; wallDrag.forward[2] = fz / fl;
 
-            const w = fluid.walls[0];
+            screenToWorldRay(e.offsetX, e.offsetY, logicalW, logicalH, camera, cv, _wallRayDir);
+            const hit = pickWall(cv.eye, _wallRayDir);
+            if (hit >= 0) selectedWall = hit;
+            else if (!fluid.walls[selectedWall].active) {
+                for (let i = 0; i < fluid.walls.length; i++) if (fluid.walls[i].active) { selectedWall = i; break; }
+            }
+
+            const w = fluid.walls[selectedWall];
+            wallDrag.wallIndex = selectedWall;
             wallDrag.planePoint[0] = (w.min[0] + w.max[0]) * 0.5;
             wallDrag.planePoint[1] = (w.min[1] + w.max[1]) * 0.5;
             wallDrag.planePoint[2] = (w.min[2] + w.max[2]) * 0.5;
 
-            screenToWorldRay(e.offsetX, e.offsetY, logicalW, logicalH, camera, cv, _wallRayDir);
             if (rayPlaneIntersect(cv.eye, _wallRayDir, wallDrag.planePoint, wallDrag.forward, wallDrag.startHit)) {
                 wallDrag.startMin.set(w.min); wallDrag.startMax.set(w.max);
                 wallDrag.active = true; wallDrag.pointerId = e.pointerId;
@@ -234,16 +304,33 @@ window.addEventListener("blur", () => { eKeyDown = false; rKeyDown = false; });
             screenToWorldRay(e.offsetX, e.offsetY, logicalW, logicalH, camera, cv, _wallRayDir);
             if (rayPlaneIntersect(cv.eye, _wallRayDir, wallDrag.planePoint, wallDrag.forward, _wallHit)) {
                 // World-space offset since drag start, clamped per axis so the moved
-                // AABB stays within the hard sim bounds (size fixed — position only).
+                // box stays within the hard sim bounds (size fixed — position only).
+                // The bound uses the rotated box's world AABB (rotation can change
+                // mid-drag via Z/X/C/V, so recompute from the current angles each
+                // move): re = |R_y(θ)·R_x(φ)| · (hx,hy,hz), row by row.
+                const hx = (wallDrag.startMax[0] - wallDrag.startMin[0]) * 0.5;
+                const hy = (wallDrag.startMax[1] - wallDrag.startMin[1]) * 0.5;
+                const hz = (wallDrag.startMax[2] - wallDrag.startMin[2]) * 0.5;
+                const dw = fluid.walls[wallDrag.wallIndex];
+                const acy = Math.abs(Math.cos(dw.theta)), asy = Math.abs(Math.sin(dw.theta));
+                const acp = Math.abs(Math.cos(dw.phi)),   asp = Math.abs(Math.sin(dw.phi));
+                _wallRotHalf[0] = acy * hx + asy * asp * hy + asy * acp * hz;
+                _wallRotHalf[1] =            acp * hy       + asp * hz;
+                _wallRotHalf[2] = asy * hx + acy * asp * hy + acy * acp * hz;
                 for (let i = 0; i < 3; i++) {
                     let delta = _wallHit[i] - wallDrag.startHit[i];
-                    const lo = fluid.HARD_MIN - wallDrag.startMin[i];
-                    const hi = _wallHardMax[i] - wallDrag.startMax[i];
-                    if (delta < lo) delta = lo; else if (delta > hi) delta = hi;
+                    const c0 = (wallDrag.startMin[i] + wallDrag.startMax[i]) * 0.5;
+                    const lo = fluid.HARD_MIN + _wallRotHalf[i] - c0;
+                    const hi = _wallHardMax[i] - _wallRotHalf[i] - c0;
+                    // lo > hi: the rotated box is wider than the domain on this axis
+                    // (e.g. the full-width demo slab mid-rotation) — don't move it there.
+                    if (lo > hi) delta = 0;
+                    else if (delta < lo) delta = lo;
+                    else if (delta > hi) delta = hi;
                     _wallNewMin[i] = wallDrag.startMin[i] + delta;
                     _wallNewMax[i] = wallDrag.startMax[i] + delta;
                 }
-                fluid.setWall(0, _wallNewMin, _wallNewMax);
+                fluid.setWall(wallDrag.wallIndex, _wallNewMin, _wallNewMax);
             }
             return;
         }
@@ -346,7 +433,7 @@ function drawOverlay(cv, viewProj, frameMs) {
     octx.fillText(`frame: ${frameMs.toFixed(2)} ms`, 16, nextY());
     octx.fillText(isMobile
         ? `drag in sim: push  drag outside: orbit  W: toggle wall`
-        : `L-drag: push fluid  R-drag: orbit  wheel: zoom  E: add  R: remove  W: toggle wall  Shift+L-drag: move wall`, 16, nextY());
+        : `L-drag: push fluid  R-drag: orbit  wheel: zoom  E: add  R: remove  W: add wall  Shift+W: remove wall  Shift+L-drag: move wall  Z/X: yaw  C/V: pitch`, 16, nextY());
 }
 
 function startLoop(encodeRender) {
@@ -410,6 +497,16 @@ function startLoop(encodeRender) {
                     }
                 }
             }
+        }
+
+        // Wall rotation on the selected wall: Z/X = yaw (counter-/clockwise viewed
+        // from above), C/V = pitch. Rate is real-time based so it matches the
+        // fixed-timestep sim accumulator; simFrame derives the angular velocity
+        // vector that drives the fluid from the per-frame angle deltas.
+        if (fluid.walls[selectedWall].active) {
+            const dYaw   = zKeyDown !== xKeyDown ? (zKeyDown ? 1 : -1) * WALL_ROT_SPEED * deltaS : 0;
+            const dPitch = cKeyDown !== vKeyDown ? (cKeyDown ? 1 : -1) * WALL_ROT_SPEED * deltaS : 0;
+            if (dYaw !== 0 || dPitch !== 0) fluid.rotateWall(selectedWall, dYaw, dPitch);
         }
 
         let simSteps = 0;

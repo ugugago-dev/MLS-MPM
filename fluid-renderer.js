@@ -1196,25 +1196,27 @@ export async function initFluidRenderer(device, canvas, particlePosBuffer, parti
         primitive: { topology: "triangle-list" },
     });
 
-    // ── Pass W: movable wall obstacles (AABB boxes) ───────────────────────
+    // ── Pass W: movable wall obstacles (Y-rotated boxes) ──────────────────
     // Vertex-pulling: no vertex buffer. Each instance is one wall (instance_index),
-    // each drawing 36 vertices (12 triangles) of a unit cube remapped into the wall's
-    // [boxMin,boxMax] AABB; inactive walls collapse to a clipped degenerate. Rendered
-    // into sceneColorTex (RENDER_SCALE) with its OWN small depth buffer for correct
-    // wall-vs-wall ordering (this composite chain otherwise has no depth attachment).
+    // each drawing 36 vertices (12 triangles) of a unit cube scaled by the wall's
+    // half extents and yaw-rotated about its center; inactive walls collapse to a
+    // clipped degenerate. Rendered into sceneColorTex (RENDER_SCALE) with its OWN
+    // small depth buffer for correct wall-vs-wall ordering (this composite chain
+    // otherwise has no depth attachment).
     // Fluid occlusion is manual (v1): a wall fragment behind the fluid surface (fluid
     // is ~opaque via Beer-Lambert) is discarded, sampling filtBTex exactly like the
     // spray-occlusion FS. Refraction of the fluid through the wall is out of scope.
     //
     // Camera uniforms reuse particleUniBuf (same 256-byte U layout as the shade pass,
-    // so screenRes is available for the filtBTex remap). Wall AABB data lives in its
+    // so screenRes is available for the filtBTex remap). Wall box data lives in its
     // own uniform buffer, uploaded only when setWalls() sees a change (dirty check).
-    // Per wall: boxMin (vec4, .xyz used) + boxMax (vec4, .w = active flag) = 32 bytes.
-    const wallUniBuf = device.createBuffer({ size: MAX_WALLS * 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-    const wallUni    = new Float32Array(MAX_WALLS * 8);   // [minx,miny,minz,_, maxx,maxy,maxz,active] ×MAX_WALLS
+    // Per wall: center+cos(yaw) + halfExtents+sin(yaw) + (cos(pitch), sin(pitch), 0, 0)
+    // = 48 bytes; inactive walls are all-zero (half.x = 0 is the collapse sentinel).
+    const wallUniBuf = device.createBuffer({ size: MAX_WALLS * 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    const wallUni    = new Float32Array(MAX_WALLS * 12);  // [cx,cy,cz,cosθ, hx,hy,hz,sinθ, cosφ,sinφ,0,0] ×MAX_WALLS
     // Last-uploaded snapshot for the dirty check; NaN-filled so the first setWalls()
     // always uploads (NaN ≠ NaN — same trick as fluid-gpu.js's _wallPrevF32).
-    const wallCache  = new Float32Array(MAX_WALLS * 8).fill(NaN);
+    const wallCache  = new Float32Array(MAX_WALLS * 12).fill(NaN);
     let wallsVisible = false;      // encode Pass W this frame? (active now, or was last frame)
     let wallsVisiblePrev = false;  // active state seen by the previous setWalls()
 
@@ -1227,7 +1229,9 @@ export async function initFluidRenderer(device, canvas, particlePosBuffer, parti
             tanHalfFovY : f32, aspect : f32, zNear : f32, zFar : f32,
             screenRes : vec2<f32>, _pad2 : vec2<f32>,   // RENDER_SCALE scene res (this pass's target)
         };
-        struct Wall { boxMin : vec4<f32>, boxMax : vec4<f32> };   // boxMax.w = active (1/0)
+        // center_cy.w = cos(yaw), half_sy.w = sin(yaw), pitch = (cosφ, sinφ, 0, 0);
+        // inactive = all-zero (half.x = 0).
+        struct Wall { center_cy : vec4<f32>, half_sy : vec4<f32>, pitch : vec4<f32> };
         @group(0) @binding(0) var<uniform> u        : U;
         @group(0) @binding(1) var<uniform> walls    : array<Wall, ${MAX_WALLS}>;
         @group(0) @binding(2) var          depthTex : texture_2d<f32>;   // filtBTex, fluid linear depth
@@ -1241,7 +1245,7 @@ export async function initFluidRenderer(device, canvas, particlePosBuffer, parti
         @vertex fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) iid: u32) -> VsOut {
             var o: VsOut;
             let w = walls[iid];
-            if (w.boxMax.w < 0.5) {
+            if (w.half_sy.x <= 0.0) {
                 // Inactive wall: emit a clipped degenerate (z > w → outside NDC) so the
                 // whole instance is discarded without producing fragments.
                 o.pos = vec4<f32>(0.0, 0.0, 2.0, 1.0);
@@ -1268,9 +1272,19 @@ export async function initFluidRenderer(device, canvas, particlePosBuffer, parti
                 vec3<f32>(0,1,0), vec3<f32>(0,-1,0)
             );
             let corner = corners[idx[vi]];
-            let world  = w.boxMin.xyz + corner * (w.boxMax.xyz - w.boxMin.xyz);
+            // Local corner (center-relative) → rotate R_y(yaw)·R_x(pitch) (same
+            // convention as shaders.js wall_to_world_dir) → translate to the center.
+            let l  = (corner * 2.0 - vec3<f32>(1.0)) * w.half_sy.xyz;
+            let cy = w.center_cy.w;  let sy = w.half_sy.w;
+            let cp = w.pitch.x;      let sp = w.pitch.y;
+            let ly = cp * l.y - sp * l.z;
+            let lz = sp * l.y + cp * l.z;
+            let world = w.center_cy.xyz + vec3<f32>(cy * l.x + sy * lz, ly, -sy * l.x + cy * lz);
+            let ln = normals[vi / 6u];
+            let ny = cp * ln.y - sp * ln.z;
+            let nz = sp * ln.y + cp * ln.z;
             o.pos    = u.viewProj * vec4<f32>(world, 1.0);
-            o.normal = normals[vi / 6u];
+            o.normal = vec3<f32>(cy * ln.x + sy * nz, ny, -sy * ln.x + cy * nz);
             o.dep    = -(u.view * vec4<f32>(world, 1.0)).z;   // positive linear view-space depth
             return o;
         }
@@ -1479,20 +1493,31 @@ export async function initFluidRenderer(device, canvas, particlePosBuffer, parti
 
     // ── setWalls: pack fluid.walls into the reused wallUni buffer, upload on change ──
     // Called by main.js once per frame with fluid.walls (MAX_WALLS-length array of
-    // { active, min:Float32Array(3), max:Float32Array(3) }, AABB in grid/world coords).
-    // Inactive slots still get their box written (so a wall toggled off then on keeps
-    // its extents), but active=0 makes the VS collapse the instance to a degenerate.
+    // { active, min:Float32Array(3), max:Float32Array(3), theta }, unrotated AABB in
+    // grid/world coords + yaw about its center). Packed as center+cosθ / half+sinθ;
+    // inactive slots are zeroed (half.x = 0 collapses the instance in the VS).
     // Uploads to the GPU uniform only when the packed data differs from the last upload.
     function setWalls(walls) {
         let anyActive = false;
         for (let i = 0; i < MAX_WALLS; i++) {
-            const b = i * 8;
+            const b = i * 12;
             const w = walls[i];   // fluid.walls is always a full MAX_WALLS-length array
-            wallUni[b]     = w.min[0]; wallUni[b + 1] = w.min[1]; wallUni[b + 2] = w.min[2];
-            wallUni[b + 3] = 0;
-            wallUni[b + 4] = w.max[0]; wallUni[b + 5] = w.max[1]; wallUni[b + 6] = w.max[2];
-            wallUni[b + 7] = w.active ? 1 : 0;
-            if (w.active) anyActive = true;
+            if (w.active) {
+                wallUni[b]      = (w.min[0] + w.max[0]) * 0.5;
+                wallUni[b + 1]  = (w.min[1] + w.max[1]) * 0.5;
+                wallUni[b + 2]  = (w.min[2] + w.max[2]) * 0.5;
+                wallUni[b + 3]  = Math.cos(w.theta);
+                wallUni[b + 4]  = (w.max[0] - w.min[0]) * 0.5;
+                wallUni[b + 5]  = (w.max[1] - w.min[1]) * 0.5;
+                wallUni[b + 6]  = (w.max[2] - w.min[2]) * 0.5;
+                wallUni[b + 7]  = Math.sin(w.theta);
+                wallUni[b + 8]  = Math.cos(w.phi);
+                wallUni[b + 9]  = Math.sin(w.phi);
+                wallUni[b + 10] = 0; wallUni[b + 11] = 0;
+                anyActive = true;
+            } else {
+                for (let k = 0; k < 12; k++) wallUni[b + k] = 0;
+            }
         }
         // Pass W runs while a wall is visible, plus one extra frame after the last
         // one disappears so the pass's loadOp:clear resets wallLinDepthTex to

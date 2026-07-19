@@ -107,40 +107,79 @@ fn hard_clamp_axis(p: f32, v: f32, lo: f32, hi: f32) -> vec2<f32> {
     return vec2<f32>(np, nv);
 }
 
-// ── 動く壁 (AABB障害物) ────────────────────────────────────────────────
-// Movable AABB obstacles, coupled to the fluid via grid boundary conditions
-// (AABB IF-test in UPDATE_GRID + G2P). Layout kept in sync with fluid-gpu.js's
-// _writeWallParams uniform (16B header + MAX_WALLS × 48B; config.js MAX_WALLS is
-// the single source of truth for the capacity).
+// ── 動く壁 (OBB障害物: AABB + 中心周り yaw θ + pitch φ) ────────────────
+// Movable box obstacles, coupled to the fluid via grid boundary conditions
+// (local-frame AABB test in UPDATE_GRID + G2P). Layout kept in sync with
+// fluid-gpu.js's _writeWallParams uniform (16B header + MAX_WALLS × 80B;
+// config.js MAX_WALLS is the single source of truth for the capacity).
 // CPU側がactive壁のみを先頭詰めでパックし、個数を count_pad.x に書く。ホットパス
 // (全セル/全粒子×substep) のループが壁ゼロ時に即終了できるようにするため —
 // per-wall の activeフラグ+continue 方式より、最頻状態 (壁なし) の固定費が消える。
-// vel is derived CPU-side each simFrame as (new min − prev-frame min)/DT.
+// 姿勢は R = R_y(θ)·R_x(φ) (yaw→pitchの合成、cos/sinはCPU側で焼いて渡す)。判定は
+// 「中心cへ平行移動 → Rᵀ でローカル化 → AABB [lmin, lmax] 判定 → 法線を R で世界へ
+// 戻す」。lmin/lmax は中心相対で、外周境界帯に接する面の実効延長 (CPU側) も込みの値。
+// 壁速度 vel と角速度ベクトル omega (= θ̇ŷ + φ̇R_y(θ)x̂) は CPU側で
+// (今回値 − 前回simFrame値)/DT として導出。
 struct Wall {
-    min_pad : vec4<f32>,   // xyz = min corner
-    max_pad : vec4<f32>,   // xyz = max corner
-    vel_pad : vec4<f32>,   // xyz = wall velocity (grid units / sim time)
+    center_cy : vec4<f32>,   // xyz = box center,               w = cos(θ) yaw
+    lmin_sy   : vec4<f32>,   // xyz = local min (center-rel.),  w = sin(θ) yaw
+    lmax_cp   : vec4<f32>,   // xyz = local max (center-rel.),  w = cos(φ) pitch
+    vel_sp    : vec4<f32>,   // xyz = linear velocity,          w = sin(φ) pitch
+    omega_pad : vec4<f32>,   // xyz = angular velocity vector (rad / sim time)
 }
 struct WallParams {
     count_pad : vec4<f32>,              // x = number of packed active walls
     walls     : array<Wall, ${MAX_WALLS}>,
 }
 
-// AABB signed distance + outward normal, packed as vec4 (xyz = normal, w = sdf).
+// 世界座標 → 壁ローカル (中心相対、Rᵀ = R_x(-φ)·R_y(-θ))。
+// R_y(θ) = [[c,0,s],[0,1,0],[-s,0,c]]、R_x(φ) = [[1,0,0],[0,c,-s],[0,s,c]]。
+fn wall_to_local(p: vec3<f32>, w: Wall) -> vec3<f32> {
+    let d  = p - w.center_cy.xyz;
+    let cy = w.center_cy.w;  let sy = w.lmin_sy.w;
+    let cp = w.lmax_cp.w;    let sp = w.vel_sp.w;
+    // R_y(-θ)
+    let x1 = cy * d.x - sy * d.z;
+    let z1 = sy * d.x + cy * d.z;
+    // R_x(-φ)
+    return vec3<f32>(x1, cp * d.y + sp * z1, -sp * d.y + cp * z1);
+}
+
+// 壁ローカルの方向ベクトル (法線) を世界座標へ戻す (R = R_y(θ)·R_x(φ))。
+fn wall_to_world_dir(v: vec3<f32>, w: Wall) -> vec3<f32> {
+    let cy = w.center_cy.w;  let sy = w.lmin_sy.w;
+    let cp = w.lmax_cp.w;    let sp = w.vel_sp.w;
+    // R_x(φ)
+    let y1 = cp * v.y - sp * v.z;
+    let z1 = sp * v.y + cp * v.z;
+    // R_y(θ)
+    return vec3<f32>(cy * v.x + sy * z1, y1, -sy * v.x + cy * z1);
+}
+
+// 世界座標 p における壁表面の速度 = 並進 + 回転成分 ω×r。
+// 回転する壁が流体を押す/引きずる駆動力はこれが担う (BCは全てこの速度基準の相対速度で書く)。
+fn wall_vel_at(p: vec3<f32>, w: Wall) -> vec3<f32> {
+    let r = p - w.center_cy.xyz;
+    return w.vel_sp.xyz + cross(w.omega_pad.xyz, r);
+}
+
+// ローカルAABB signed distance + outward normal, packed as vec4 (xyz = normal, w = sdf).
+// 引数 lp は wall_to_local() 済みのローカル座標、返る法線もローカル (使用側で
+// wall_to_world_dir() を掛けて世界へ戻す)。
 // Outside (w > 0): normal points from the nearest box face toward the query point
 //   (= face normal in the face region, corner-diagonal past a corner).
 // Inside  (w < 0): normal is the SHALLOWEST-penetration face's outward normal, so
 //   pushing along it by -w escapes the box by the least distance.
 // Shared by UPDATE_GRID (velocity BC), G2P (position push-out) and DIFFUSE_ADVECT.
-fn wall_sdf_normal(p: vec3<f32>, mn: vec3<f32>, mx: vec3<f32>) -> vec4<f32> {
-    let dmin = mn - p;   // per-axis: >0 ⇒ p is below the min face
-    let dmax = p - mx;   // per-axis: >0 ⇒ p is above the max face
+fn wall_sdf_normal(lp: vec3<f32>, mn: vec3<f32>, mx: vec3<f32>) -> vec4<f32> {
+    let dmin = mn - lp;  // per-axis: >0 ⇒ lp is below the min face
+    let dmax = lp - mx;  // per-axis: >0 ⇒ lp is above the max face
     let q    = max(dmin, dmax);
     let qmax = max(q.x, max(q.y, q.z));
     if (qmax > 0.0) {
         // Outside on at least one axis: distance/normal from the nearest surface point.
-        let nearest = clamp(p, mn, mx);
-        let diff    = p - nearest;
+        let nearest = clamp(lp, mn, mx);
+        let diff    = lp - nearest;
         let len     = length(diff);   // = distance to the box surface (|max(q,0)|)
         let n = select(vec3<f32>(0.0, 1.0, 0.0), diff / len, len > 1e-6);
         return vec4<f32>(n, len);
@@ -449,18 +488,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var wv = vec3<f32>(vx, vy, vz);
     for (var wi = 0u; wi < u32(wallp.count_pad.x); wi++) {
         let wall = wallp.walls[wi];
-        let mn   = wall.min_pad.xyz;
-        let mx   = wall.max_pad.xyz;
+        let lp   = wall_to_local(cellPos, wall);
+        let mn   = wall.lmin_sy.xyz;
+        let mx   = wall.lmax_cp.xyz;
         // 安価な棄却: 表面帯 (1セル) 込みの拡張AABBの外なら、SDF (sqrt/div) を払わず抜ける。
-        if (any(cellPos < mn - vec3<f32>(1.0)) || any(cellPos > mx + vec3<f32>(1.0))) { continue; }
-        let wvel = wall.vel_pad.xyz;
-        let sn   = wall_sdf_normal(cellPos, mn, mx);
+        if (any(lp < mn - vec3<f32>(1.0)) || any(lp > mx + vec3<f32>(1.0))) { continue; }
+        let wvel = wall_vel_at(cellPos, wall);
+        let sn   = wall_sdf_normal(lp, mn, mx);
         if (sn.w < 0.0) {
             wv = wvel;
         } else if (sn.w < 1.0) {
+            let n    = wall_to_world_dir(sn.xyz, wall);
             let vrel = wv - wvel;
-            let vn   = dot(vrel, sn.xyz);
-            if (vn < 0.0) { wv = wv - vn * sn.xyz; }
+            let vn   = dot(vrel, n);
+            if (vn < 0.0) { wv = wv - vn * n; }
         }
     }
     vx = wv.x; vy = wv.y; vz = wv.z;
@@ -615,9 +656,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // 動く壁 (AABB) の押し出し。床バネと同じ場所 (ハードクランプの前) で生のnp/nvを使う。
     for (var wi = 0u; wi < u32(wallp.count_pad.x); wi++) {
         let wall = wallp.walls[wi];
-        let wmin = wall.min_pad.xyz;
-        let wmax = wall.max_pad.xyz;
-        let wvel = wall.vel_pad.xyz;
+        let wmin = wall.lmin_sy.xyz;
+        let wmax = wall.lmax_cp.xyz;
 
         // バネ補正: lookahead予測位置が「壁に食い込む」(sdf<0) ときだけ法線方向へ減速材として
         // 効かせる。以前は近接ゾーン(wall_min=3セル)で常時押し出していたが、それだと壁際に
@@ -626,13 +666,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // UPDATE_GRID のIF速度帯に任せ、粒子は壁面に密着させる (全高で隙間ゼロ=均一)。
         // lookahead があるので、動く壁へ突っ込む粒子は実接触の前に減速される。
         // どちらの補正も結果を使うのは「内部 (sdf<0)」のときだけなので、SDFのフル計算
-        // (clamp/sqrt/div) の前に6比較の内包テストを置き、壁の外の大多数の粒子を素通しする。
+        // (clamp/sqrt/div) の前にローカル化+6比較の内包テストを置き、壁の外の大多数の粒子を素通しする。
         let xnw = np + nv * params.dt * params.lookahead_k;
-        if (all(xnw > wmin) && all(xnw < wmax)) {
-            let sxn   = wall_sdf_normal(xnw, wmin, wmax);
+        let lxn = wall_to_local(xnw, wall);
+        if (all(lxn > wmin) && all(lxn < wmax)) {
+            let sxn   = wall_sdf_normal(lxn, wmin, wmax);
             let dist  = -sxn.w;
             let blend = clamp(dist / params.wall_min, 0.0, 1.0);
-            nv += sxn.xyz * (params.wall_stiffness * blend * dist);
+            nv += wall_to_world_dir(sxn.xyz, wall) * (params.wall_stiffness * blend * dist);
         }
 
         // 安全弁: 更新後位置がなお壁内部なら最近傍表面へ投影し、壁との相対速度の
@@ -641,11 +682,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // すると界面に密度スパイクが立ち、EOS圧力が粒子を吹き上げる自励噴出ループになる。
         // 0.5セル/ステップの漸進排出なら圧力場が追従できる (深く埋まった粒子のテレポートによる
         // 密度スパイク噴出を防ぐ汎用の安定化)。
-        if (all(np > wmin) && all(np < wmax)) {
-            let snp = wall_sdf_normal(np, wmin, wmax);
-            np = np - snp.xyz * max(snp.w, -0.5);
-            let vn = dot(nv - wvel, snp.xyz);
-            if (vn < 0.0) { nv -= vn * snp.xyz; }
+        let lnp = wall_to_local(np, wall);
+        if (all(lnp > wmin) && all(lnp < wmax)) {
+            let snp = wall_sdf_normal(lnp, wmin, wmax);
+            let n   = wall_to_world_dir(snp.xyz, wall);
+            np = np - n * max(snp.w, -0.5);
+            let vn = dot(nv - wall_vel_at(np, wall), n);
+            if (vn < 0.0) { nv -= vn * n; }
         }
     }
 
@@ -918,17 +961,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // 全active壁 (w >= 0.5) に適用。diffuse は装飾トレーサーで壁を突き抜けると見栄えが悪い。
     for (var wi = 0u; wi < u32(wallp.count_pad.x); wi++) {
         let wall = wallp.walls[wi];
-        let mn   = wall.min_pad.xyz;
-        let mx   = wall.max_pad.xyz;
-        // 押し出しは内部 (sdf<0) のときだけなので、フルSDFの前に安価な内包テストを置く。
-        if (!(all(p.pos.xyz > mn) && all(p.pos.xyz < mx))) { continue; }
-        let sn = wall_sdf_normal(p.pos.xyz, mn, mx);
-        p.pos = vec4<f32>(p.pos.xyz - sn.xyz * sn.w, 0.0);   // 最近傍表面へ押し出し
-        let wvel = wall.vel_pad.xyz;
+        let mn   = wall.lmin_sy.xyz;
+        let mx   = wall.lmax_cp.xyz;
+        // 押し出しは内部 (sdf<0) のときだけなので、フルSDFの前にローカル化+内包テストを置く。
+        let lp = wall_to_local(p.pos.xyz, wall);
+        if (!(all(lp > mn) && all(lp < mx))) { continue; }
+        let sn = wall_sdf_normal(lp, mn, mx);
+        let n  = wall_to_world_dir(sn.xyz, wall);
+        p.pos = vec4<f32>(p.pos.xyz - n * sn.w, 0.0);   // 最近傍表面へ押し出し
+        let wvel = wall_vel_at(p.pos.xyz, wall);
         let vrel = p.vel.xyz - wvel;
-        let vn   = dot(vrel, sn.xyz);
+        let vn   = dot(vrel, n);
         if (vn < 0.0) {
-            let newvrel = vrel - (1.0 + DIFFUSE_RESTITUTION) * vn * sn.xyz;
+            let newvrel = vrel - (1.0 + DIFFUSE_RESTITUTION) * vn * n;
             p.vel = vec4<f32>(wvel + newvrel, 0.0);
         }
     }

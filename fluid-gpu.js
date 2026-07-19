@@ -49,37 +49,55 @@ export class FluidGPU {
         // compute pass) once per substep, right after G2P — see diffuse-gpu.js.
         this.diffuse = null;
 
-        // 動く壁 (AABB障害物)。グリッドBC方式 (UPDATE_GRID/G2P のAABB IF判定) で流体と結合する。
-        // 呼び出し側 (main.js) は setWall(i, min, max) で位置を動かすだけ。壁速度は simFrame()
-        // 冒頭で (今回min − 前回simFrame時min)/DT として内部導出し uniform に書く
-        // (=次の setWall まで vel=0)。レンダラーが毎フレーム this.walls を読んでボックスを描く。
-        // min/max はグリッド座標。uniform には active壁のみ先頭詰めでパックし個数をヘッダに書く
-        // (_writeWallParams 参照)。
+        // 動く壁 (OBB障害物 = 未回転AABB + 中心周りY軸回転theta)。グリッドBC方式
+        // (UPDATE_GRID/G2P のローカル座標AABB IF判定) で流体と結合する。
+        // 呼び出し側 (main.js) は setWall(i, min, max) で位置を、rotateWall(i, dTheta) で
+        // 向きを動かすだけ。壁速度は simFrame() 冒頭で (今回min − 前回simFrame時min)/DT、
+        // 角速度は (今回theta − 前回theta)/DT として内部導出し uniform に書く
+        // (=次の setWall/rotateWall まで vel=ω=0)。レンダラーが毎フレーム this.walls を読んで
+        // 回転ボックスを描く。min/max はグリッド座標の「未回転」箱 (thetaで中心周りに回る)。
+        // uniform には active壁のみ先頭詰めでパックし個数をヘッダに書く (_writeWallParams 参照)。
         this.walls = [];
-        this._wallPrevMin = [];   // 各壁の前回simFrame時のmin (速度導出用)
+        this._wallPrevMin = [];     // 各壁の前回simFrame時のmin (速度導出用)
+        this._wallPrevTheta = [];   // 各壁の前回simFrame時のtheta=yaw (角速度導出用)
+        this._wallPrevPhi = [];     // 各壁の前回simFrame時のphi=pitch (角速度導出用)
         for (let i = 0; i < MAX_WALLS; i++) {
-            this.walls.push({ active: false, min: new Float32Array(3), max: new Float32Array(3) });
+            this.walls.push({ active: false, min: new Float32Array(3), max: new Float32Array(3), theta: 0, phi: 0 });
             this._wallPrevMin.push(new Float32Array(3));
+            this._wallPrevTheta.push(0);
+            this._wallPrevPhi.push(0);
         }
     }
 
     // 壁iをactive化しAABBを設定 (min/max は長さ3の配列様)。位置を動かすだけでよく、
-    // 壁速度は simFrame() が今回minと前回minの差から導出する。
+    // 壁速度は simFrame() が今回minと前回minの差から導出する。theta は保持される
+    // (非active→activeの再出現でも前回の向きを維持。リセットしたければ resetWallTheta)。
     setWall(i, min, max) {
         const w = this.walls[i];
-        // 非active→activeの遷移では前回minを新しい位置に同期する。さもないと次のsimFrameで
-        // vel=(新min−旧位置)/DT の巨大な見かけ速度が1フレーム分流体に注入され、出現しただけで
-        // 流体が吹き飛ぶ (壁の「出現」は移動ではないので速度0が正しい)。
+        // 非active→activeの遷移では前回min/前回thetaを現在値に同期する。さもないと次の
+        // simFrameで vel=(新min−旧位置)/DT の巨大な見かけ速度が1フレーム分流体に注入され、
+        // 出現しただけで流体が吹き飛ぶ (壁の「出現」は移動ではないので速度0が正しい)。
         if (!w.active) {
             const prev = this._wallPrevMin[i];
             prev[0] = min[0]; prev[1] = min[1]; prev[2] = min[2];
+            this._wallPrevTheta[i] = w.theta;
+            this._wallPrevPhi[i]   = w.phi;
         }
         w.active = true;
         w.min[0] = min[0]; w.min[1] = min[1]; w.min[2] = min[2];
         w.max[0] = max[0]; w.max[1] = max[1]; w.max[2] = max[2];
     }
 
-    // 壁iを非active化 (シェーダ側は min_active.w=0 で無視)。
+    // 壁iを中心周りに回す: dTheta = yaw (Y軸)、dPhi = pitch (壁ローカルX軸) [rad]。
+    // 姿勢は R = R_y(theta)·R_x(phi) の合成。角速度は simFrame() が両角度の差分から
+    // ベクトルとして導出するので、呼び出し側は角度を動かすだけでよい。非activeなら無視。
+    rotateWall(i, dTheta, dPhi = 0) {
+        if (!this.walls[i].active) return;
+        this.walls[i].theta += dTheta;
+        this.walls[i].phi   += dPhi;
+    }
+
+    // 壁iを非active化 (uniformにはパックされなくなる)。
     removeWall(i) {
         this.walls[i].active = false;
     }
@@ -203,10 +221,11 @@ export class FluidGPU {
         // 80 bytes: the original 12 fields (48B) + bbox_min/bbox_max (6×i32) + 2×pad
         // (32B) — see updateHand()/WGSL_APPLY_HAND for why the bbox exists.
         this.handParamsBuffer     = d.createBuffer({ size: 80,        usage: UN | CD });
-        // 動く壁 uniform: 16Bヘッダ (count) + MAX_WALLS × 48B (Wall = min/max/vel の 3×vec4)。
+        // 動く壁 uniform: 16Bヘッダ (count) + MAX_WALLS × 80B
+        // (Wall = center_cy/lmin_sy/lmax_cp/vel_sp/omega_pad の 5×vec4)。
         // active壁のみ先頭詰めでパックする (_writeWallParams)。WebGPUは createBuffer を
         // ゼロ初期化するので、初期状態 (count=0=壁なし) はそのまま有効。
-        this.wallParamsBuffer     = d.createBuffer({ size: 16 + MAX_WALLS * 48, usage: UN | CD });
+        this.wallParamsBuffer     = d.createBuffer({ size: 16 + MAX_WALLS * 80, usage: UN | CD });
 
         // Delete (stream-compaction) scratch buffers — see spawnParticles()/deleteNear().
         // Affine is intentionally not double-buffered here (see WGSL_COMPACT comment).
@@ -242,12 +261,12 @@ export class FluidGPU {
         this._rayPending = false;
         this.lastRayHit = null;
 
-        // 壁 uniform の再利用CPUバッファ (ヘッダ4 f32 + 12 f32/wall: min.xyz+pad, max.xyz+pad,
-        // vel.xyz+pad)。_wallPrevF32 は NaN 埋めで初回 _writeWallParams() を必ずアップロード
-        // させる (paramsBufferのdedupパターンとNaN≠NaNを併用)。
-        this._wallBuf     = new ArrayBuffer(16 + MAX_WALLS * 48);
+        // 壁 uniform の再利用CPUバッファ (ヘッダ4 f32 + 20 f32/wall: center.xyz+cosθ,
+        // lmin.xyz+sinθ, lmax.xyz+cosφ, vel.xyz+sinφ, ω.xyz+pad)。_wallPrevF32 は NaN 埋めで
+        // 初回 _writeWallParams() を必ずアップロードさせる (paramsBufferのdedupパターンとNaN≠NaNを併用)。
+        this._wallBuf     = new ArrayBuffer(16 + MAX_WALLS * 80);
         this._wallF32     = new Float32Array(this._wallBuf);
-        this._wallPrevF32 = new Float32Array(4 + MAX_WALLS * 12).fill(NaN);
+        this._wallPrevF32 = new Float32Array(4 + MAX_WALLS * 20).fill(NaN);
 
         // Reused scratch arrays for spawnParticles() — sized to the full particle
         // capacity so any valid n never needs a fallback allocation. Mass is always
@@ -324,36 +343,60 @@ export class FluidGPU {
         for (let i = 0; i < MAX_WALLS; i++) {
             const w = this.walls[i];
             const prev = this._wallPrevMin[i];
-            // 壁速度は必ず「実寸の min」で導出する。実効AABBへのスナップで見かけ速度が
-            // 発生してはならないため (延長は sim判定のためだけの変換で、実移動ではない)。
-            let vx = 0, vy = 0, vz = 0;
+            // 壁速度・角速度は必ず「実寸のmin / 生のtheta・phi」で導出する。実効AABBへの
+            // スナップで見かけ速度が発生してはならないため (延長は sim判定のためだけの変換)。
+            let vx = 0, vy = 0, vz = 0, dTheta = 0, dPhi = 0;
             if (w.active) {
                 vx = (w.min[0] - prev[0]) * invDt;
                 vy = (w.min[1] - prev[1]) * invDt;
                 vz = (w.min[2] - prev[2]) * invDt;
+                dTheta = (w.theta - this._wallPrevTheta[i]) * invDt;
+                dPhi   = (w.phi   - this._wallPrevPhi[i])   * invDt;
             }
             prev[0] = w.min[0]; prev[1] = w.min[1]; prev[2] = w.min[2];
+            this._wallPrevTheta[i] = w.theta;
+            this._wallPrevPhi[i]   = w.phi;
             if (!w.active) continue;
 
-            // sim判定用の実効AABB。外周境界帯に接している面はグリッド外まで延長する
-            // (床のymin IF帯と同じ思想)。理由: 壁のAABB底面が HARD_MIN (床の水が静止する
-            // 高さ) と同一平面にあると、床の水層の粒子に対して壁SDFの最近傍面が「底面」に
-            // なり法線が下向きになる → 横に押すべき粒子を床へ押し付け、壁の根元に水が
-            // 潜り込む/張り付く。面を境界外へ延ばすとその面が流体領域から消え、法線は
-            // 側面のみになる。this.walls の実寸は変えない (レンダラーが実寸を描くため)。
-            const base = 4 + count * 12;
-            this._wallF32[base + 0] = w.min[0] <= HM1 ? -4.0 : w.min[0];
-            this._wallF32[base + 1] = w.min[1] <= HM1 ? -4.0 : w.min[1];
-            this._wallF32[base + 2] = w.min[2] <= HM1 ? -4.0 : w.min[2];
-            this._wallF32[base + 3] = 0.0;
-            this._wallF32[base + 4] = w.max[0] >= this.HARD_MAX_X - 1.0 ? this.grid_X_num + 4.0 : w.max[0];
-            this._wallF32[base + 5] = w.max[1] >= this.HARD_MAX_Y - 1.0 ? this.grid_Y_num + 4.0 : w.max[1];
-            this._wallF32[base + 6] = w.max[2] >= this.HARD_MAX_Z - 1.0 ? this.grid_Z_num + 4.0 : w.max[2];
-            this._wallF32[base + 7] = 0.0;
-            this._wallF32[base + 8]  = vx;
-            this._wallF32[base + 9]  = vy;
-            this._wallF32[base + 10] = vz;
-            this._wallF32[base + 11] = 0.0;
+            const cx = (w.min[0] + w.max[0]) * 0.5;
+            const cy = (w.min[1] + w.max[1]) * 0.5;
+            const cz = (w.min[2] + w.max[2]) * 0.5;
+            const cyw = Math.cos(w.theta), syw = Math.sin(w.theta);   // yaw
+            const cp  = Math.cos(w.phi),   sp  = Math.sin(w.phi);     // pitch
+
+            // 姿勢 R = R_y(θ)·R_x(φ) の角速度ベクトル: ω = θ̇·ŷ + φ̇·R_y(θ)x̂
+            // = (φ̇cosθ, θ̇, -φ̇sinθ)。シェーダの wall_vel_at が v + ω×r で表面速度にする。
+            const omx = dPhi * cyw, omy = dTheta, omz = -dPhi * syw;
+
+            // sim判定用の実効AABB (中心相対ローカル値)。外周境界帯に接している面はグリッド外
+            // まで延長する (床のymin IF帯と同じ思想)。理由: 壁の底面が HARD_MIN (床の水が
+            // 静止する高さ) と同一平面にあると、床の水層の粒子に対して壁SDFの最近傍面が
+            // 「底面」になり法線が下向きになる → 横に押すべき粒子を床へ押し付け、壁の根元に
+            // 水が潜り込む/張り付く。面を境界外へ延ばすとその面が流体領域から消える。
+            // 延長は壁面が外周面と平行なときのみ意味を持つ: Y面はpitch≈0のとき、
+            // X/Z面はyaw・pitchともほぼ0のときだけ適用する (回転中の壁の端はグリッド内に
+            // 露出するので延長しないのが正しい)。this.walls の実寸は変えない (レンダラーが実寸を描く)。
+            let lminx = w.min[0] - cx, lminy = w.min[1] - cy, lminz = w.min[2] - cz;
+            let lmaxx = w.max[0] - cx, lmaxy = w.max[1] - cy, lmaxz = w.max[2] - cz;
+            const pitchAligned = Math.abs(sp) < 0.05 && cp > 0.95;
+            if (pitchAligned) {
+                if (w.min[1] <= HM1)                   { lminy = -4.0 - cy; }
+                if (w.max[1] >= this.HARD_MAX_Y - 1.0) { lmaxy = this.grid_Y_num + 4.0 - cy; }
+                if (Math.abs(syw) < 0.05 && cyw > 0.95) {
+                    if (w.min[0] <= HM1)                   { lminx = -4.0 - cx; }
+                    if (w.min[2] <= HM1)                   { lminz = -4.0 - cz; }
+                    if (w.max[0] >= this.HARD_MAX_X - 1.0) { lmaxx = this.grid_X_num + 4.0 - cx; }
+                    if (w.max[2] >= this.HARD_MAX_Z - 1.0) { lmaxz = this.grid_Z_num + 4.0 - cz; }
+                }
+            }
+
+            const base = 4 + count * 20;
+            const f = this._wallF32;
+            f[base + 0]  = cx;    f[base + 1]  = cy;    f[base + 2]  = cz;    f[base + 3]  = cyw;
+            f[base + 4]  = lminx; f[base + 5]  = lminy; f[base + 6]  = lminz; f[base + 7]  = syw;
+            f[base + 8]  = lmaxx; f[base + 9]  = lmaxy; f[base + 10] = lmaxz; f[base + 11] = cp;
+            f[base + 12] = vx;    f[base + 13] = vy;    f[base + 14] = vz;    f[base + 15] = sp;
+            f[base + 16] = omx;   f[base + 17] = omy;   f[base + 18] = omz;   f[base + 19] = 0.0;
             count++;
         }
         this._wallF32[0] = count;
@@ -361,7 +404,7 @@ export class FluidGPU {
         // (dedup比較にも「変化なし」として乗るだけ)。
 
         let same = true;
-        for (let i = 0; i < 4 + MAX_WALLS * 12; i++) {
+        for (let i = 0; i < 4 + MAX_WALLS * 20; i++) {
             if (this._wallF32[i] !== this._wallPrevF32[i]) { same = false; break; }
         }
         if (same) return;
